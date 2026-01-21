@@ -157,6 +157,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
             )
 
     def parse_company_profile(self, response):
+        # Login sayfası kontrolü
+        if 'authwall' in response.url.lower() or 'login' in response.url.lower():
+            self.logger.error(f"❌ Login sayfasına yönlendirildi: {response.url}")
+            self.logger.error(f"💡 Cookie'ler expire olmuş olabilir. Cookie'leri yenileyin: python3 setup_linkedin_login.py")
+            return
+        
+        # Sayfa içeriğinde login formu var mı kontrol et
+        if response.css('form[action*="login"]') or response.css('.authwall-sign-in-form'):
+            self.logger.error(f"❌ Login formu tespit edildi: {response.url}")
+            self.logger.error(f"💡 Cookie'leri yenileyin: python3 setup_linkedin_login.py")
+            return
+        
         company_item = {}
         company_item["sector_query"] = response.meta.get("sector", self.sector)
         company_item["company_linkedin_url"] = response.meta.get("company_url", response.url)

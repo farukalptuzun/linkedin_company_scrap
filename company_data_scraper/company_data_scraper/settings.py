@@ -12,9 +12,14 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
 # Be polite / reduce ban risk
-DOWNLOAD_DELAY = 1.5
+DOWNLOAD_DELAY = 3
 RANDOMIZE_DOWNLOAD_DELAY = True
-CONCURRENT_REQUESTS = 8
+CONCURRENT_REQUESTS = 4
+
+# HTTP 999 (LinkedIn rate limit) için retry
+RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429, 999]
+RETRY_TIMES = 3
+RETRY_PRIORITY_ADJUST = -1
 
 # Single pipeline entry point
 ITEM_PIPELINES = {

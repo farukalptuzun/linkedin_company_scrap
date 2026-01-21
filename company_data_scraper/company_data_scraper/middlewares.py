@@ -112,10 +112,12 @@ class SeleniumMiddleware:
             from selenium.webdriver.chrome.options import Options
             from selenium.webdriver.chrome.service import Service
             from webdriver_manager.chrome import ChromeDriverManager
+            from company_data_scraper.cookie_manager import LinkedInCookieManager
             import os
+            import time
             
             chrome_options = Options()
-            chrome_options.add_argument('--headless')  # Run in background
+            chrome_options.add_argument('--headless=new')  # Yeni headless mod
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-blink-features=AutomationControlled')
@@ -138,13 +140,16 @@ class SeleniumMiddleware:
                     chrome_options.binary_location = chrome_binary
                     break
             
+            # Cookie yöneticisini başlat
+            self.cookie_manager = LinkedInCookieManager()
+            cookies_loaded = self.cookie_manager.load_cookies()
+            
             # Try to use webdriver-manager for automatic driver management
             try:
                 service = Service(ChromeDriverManager().install())
                 if chrome_binary:
                     self.driver = webdriver.Chrome(service=service, options=chrome_options)
                 else:
-                    # Let Selenium find Chrome automatically
                     self.driver = webdriver.Chrome(service=service, options=chrome_options)
             except Exception as e1:
                 # Fallback: try without webdriver-manager
@@ -155,6 +160,29 @@ class SeleniumMiddleware:
                         self.driver = webdriver.Chrome(options=chrome_options)
                 except Exception as e2:
                     raise Exception(f"Chrome initialization failed. Chrome binary: {chrome_binary}, Error1: {e1}, Error2: {e2}")
+            
+            # Cookie'leri yükle
+            if cookies_loaded:
+                cookies = self.cookie_manager.get_cookies()
+                # Önce bir sayfaya git (cookie eklemek için)
+                self.driver.get("https://www.linkedin.com")
+                time.sleep(1)
+                # Cookie'leri ekle
+                cookies_added = 0
+                for cookie in cookies:
+                    try:
+                        # Selenium cookie formatına çevir
+                        if 'expiry' in cookie:
+                            # expiry değeri çok büyükse (expired) atla veya düzelt
+                            if cookie['expiry'] > 2147483647:  # Max int32
+                                cookie['expiry'] = int(time.time()) + 86400  # 1 gün ekle
+                        self.driver.add_cookie(cookie)
+                        cookies_added += 1
+                    except Exception as e:
+                        pass  # Bazı cookie'ler eklenemeyebilir
+                print(f"✅ {cookies_added}/{len(cookies)} cookie yüklendi")
+            else:
+                print("⚠️  Cookie bulunamadı. İlk kurulum için: python3 setup_linkedin_login.py")
             
             self.driver.implicitly_wait(10)
             self.driver_initialized = True
@@ -174,34 +202,27 @@ class SeleniumMiddleware:
         return middleware
         
     def process_request(self, request, spider):
-        # Only use Selenium for LinkedIn search pages (not cache, not company profiles)
+        # Use Selenium for both LinkedIn search pages AND company profile pages
         if not self.driver_initialized:
             return None
-            
-        if 'linkedin.com/search/results/companies' in request.url and 'webcache' not in request.url:
+        
+        # Check if this is a LinkedIn page that needs JavaScript rendering
+        is_search_page = 'linkedin.com/search/results/companies' in request.url and 'webcache' not in request.url
+        is_company_profile = 'linkedin.com/company/' in request.url and 'webcache' not in request.url
+        
+        if is_search_page or is_company_profile:
             try:
+                import time
                 self.driver.get(request.url)
-                # Wait for content to load
-                from selenium.webdriver.support.ui import WebDriverWait
-                from selenium.webdriver.support import expected_conditions as EC
-                from selenium.webdriver.common.by import By
+                time.sleep(3)  # Sayfanın yüklenmesini bekle
                 
-                try:
-                    # Wait for search results to appear (multiple possible selectors)
-                    WebDriverWait(self.driver, 15).until(
-                        EC.any_of(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/company/']")),
-                            EC.presence_of_element_located((By.CSS_SELECTOR, ".search-result")),
-                            EC.presence_of_element_located((By.CSS_SELECTOR, ".entity-result")),
-                            EC.presence_of_element_located((By.CSS_SELECTOR, ".reusable-search__result-container"))
-                        )
-                    )
-                except:
-                    # Wait a bit anyway for JavaScript to execute
-                    import time
-                    time.sleep(3)
+                # Login sayfasına yönlendirilmiş mi kontrol et
+                if 'login' in self.driver.current_url.lower():
+                    spider.logger.error("❌ LinkedIn login sayfasına yönlendirildi. Cookie'ler expire olmuş olabilir.")
+                    spider.logger.error("💡 Çözüm: python3 setup_linkedin_login.py çalıştırın")
+                    return None
                 
-                # Get page source after JavaScript execution
+                # Sayfa kaynağını al
                 body = self.driver.page_source.encode('utf-8')
                 
                 # Create a new response with the rendered HTML
