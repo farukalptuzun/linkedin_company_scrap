@@ -12,7 +12,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
     """
 
     name = "sector_based_scraper"
-    
+
     # Email regex pattern (matches most common email formats)
     EMAIL_PATTERN = re.compile(
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
@@ -36,6 +36,19 @@ class SectorBasedScraperSpider(scrapy.Spider):
         '/contact-us',
         '/bize-ulasin',
     ]
+    
+    # Sector/Industry mapping for Turkish-English matching
+    SECTOR_MAPPINGS = {
+        'technology': ['technology', 'bilgi teknolojisi', 'bt', 'information technology', 'it', 
+                      'bt hizmetleri', 'bilgi teknolojisi ve hizmetleri', 'information technology and services'],
+        'bt': ['bt', 'bilgi teknolojisi', 'technology', 'information technology', 'it',
+              'bt hizmetleri', 'bilgi teknolojisi ve hizmetleri'],
+        'finance': ['finance', 'finans', 'financial services', 'finansal hizmetler'],
+        'healthcare': ['healthcare', 'sağlık', 'health', 'sağlık hizmetleri'],
+        'manufacturing': ['manufacturing', 'imalat', 'üretim'],
+        'retail': ['retail', 'perakende', 'retail trade'],
+        'education': ['education', 'eğitim', 'educational services'],
+    }
 
     def __init__(self, sector: str = "", location: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -68,7 +81,9 @@ class SectorBasedScraperSpider(scrapy.Spider):
         # Add location to search URL if provided
         if self.location:
             encoded_location = quote_plus(self.location)
-            search_url += f"&location={encoded_location}"
+            search_url += f"&geoId=&location={encoded_location}"
+        
+        self.logger.info(f"🔍 Starting search: {search_url}")
         
         cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
@@ -126,6 +141,12 @@ class SectorBasedScraperSpider(scrapy.Spider):
             '.entity-result__title-text a[href*="/company/"]',  # Entity result title links
             '.search-result__result-link[href*="/company/"]',  # Search result links
             'div[data-chameleon-result-urn] a[href*="/company/"]',  # Result cards with URN
+            'li[data-chameleon-result-urn] a[href*="/company/"]',  # List items with URN
+            '.reusable-search__result-container a[href*="/company/"]',  # Reusable search results
+            'a.app-aware-link[href*="/company/"]',  # App-aware links
+            '[data-test-id="search-result"] a[href*="/company/"]',  # Test IDs
+            '.search-result__wrapper a[href*="/company/"]',  # Search result wrapper
+            '.entity-result a[href*="/company/"]',  # Entity result links
         ]
         
         for selector in selectors:
@@ -156,11 +177,14 @@ class SectorBasedScraperSpider(scrapy.Spider):
             if self.processed_count >= self.limit:
                 self.logger.info(f"Reached limit of {self.limit} companies")
                 return
-                
-            if company_url in self._seen_company_urls:
-                self.logger.debug(f"Skipping duplicate URL: {company_url}")
+            
+            # Normalize URL for duplicate checking (remove /about/ suffix)
+            # This ensures we don't process the same company twice
+            base_url = company_url.rstrip('/').replace('/about', '')
+            if base_url in self._seen_company_urls:
+                self.logger.debug(f"Skipping duplicate URL: {base_url} (original: {company_url})")
                 continue
-            self._seen_company_urls.add(company_url)
+            self._seen_company_urls.add(base_url)
             
             # Try to get the about page first (has more contact info)
             # Convert /company/name/ to /company/name/about/
@@ -168,51 +192,66 @@ class SectorBasedScraperSpider(scrapy.Spider):
             if not company_url.endswith('/about/'):
                 about_url = company_url.rstrip('/') + '/about/'
             
-            self.logger.info(f"🔍 Requesting company profile: {about_url}")
+            self.logger.info(f"🔍 Requesting company profile: {about_url} (base: {base_url})")
             yield scrapy.Request(
                 url=about_url,
                 callback=self.parse_company_profile,
-                meta={"sector": self.sector, "location": self.location, "company_url": company_url},
+                meta={"sector": self.sector, "location": self.location, "company_url": base_url},
                 errback=self.handle_company_profile_error,
             )
 
         # Try pagination: LinkedIn typically supports `page=` in the query for some UIs.
         # Only paginate if we haven't reached the limit and found results
-        if page <= self.max_pages and normalized_urls and self.processed_count < self.limit:
-            next_page = page + 1
-            use_cache = response.meta.get("use_cache", False)
-            
-            if use_cache:
-                # Use Google Cache for pagination
-                next_search_url = f"{search_url}&page={next_page}"
-                next_cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{next_search_url}"
-                next_url = next_cache_url
+        # Count how many new (non-duplicate) URLs were found
+        new_urls_count = sum(1 for url in normalized_urls 
+                            if url.rstrip('/').replace('/about', '') not in self._seen_company_urls)
+        
+        if page <= self.max_pages and self.processed_count < self.limit:
+            # Continue pagination if:
+            # 1. We found new URLs on this page, OR
+            # 2. This is the first page (might have duplicates from previous runs)
+            if new_urls_count > 0 or page == 1:
+                next_page = page + 1
+                use_cache = response.meta.get("use_cache", False)
+                
+                if use_cache:
+                    # Use Google Cache for pagination
+                    next_search_url = f"{search_url}&page={next_page}"
+                    next_cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{next_search_url}"
+                    next_url = next_cache_url
+                else:
+                    # Use direct LinkedIn URL for pagination
+                    # LinkedIn uses start parameter for pagination: start=0, start=10, start=20, etc.
+                    start_param = (next_page - 1) * 10
+                    # LinkedIn typically shows 10 results per page
+                    if '?' in search_url:
+                        next_search_url = f"{search_url}&start={start_param}"
+                    else:
+                        next_search_url = f"{search_url}?start={start_param}"
+                    next_url = next_search_url
+                    self.logger.info(f"📄 Requesting page {next_page} (start={start_param}, found {new_urls_count} new URLs)")
+                
+                yield scrapy.Request(
+                    url=next_url,
+                    callback=self.parse_search_results,
+                    errback=self.errback_handler,
+                    meta={
+                        "page": next_page,
+                        "search_url": search_url,
+                        "cache_url": f"https://webcache.googleusercontent.com/search?q=cache:{search_url}&page={next_page}",
+                        "use_cache": use_cache
+                    },
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5", 
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                    } if not use_cache else {},
+                    dont_filter=True
+                )
             else:
-                # Use direct LinkedIn URL for pagination
-                # LinkedIn uses start parameter for pagination: start=0, start=10, start=20, etc.
-                start_param = (next_page - 1) * 10
-                next_search_url = f"{search_url}&start={start_param}"
-                next_url = next_search_url
-            
-            yield scrapy.Request(
-                url=next_url,
-                callback=self.parse_search_results,
-                errback=self.errback_handler,
-                meta={
-                    "page": next_page,
-                    "search_url": search_url,
-                    "cache_url": f"https://webcache.googleusercontent.com/search?q=cache:{search_url}&page={next_page}",
-                    "use_cache": use_cache
-                },
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5", 
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                } if not use_cache else {},
-                dont_filter=True
-            )
+                self.logger.info(f"⏹️  Stopping pagination: No new URLs found on page {page} (all duplicates)")
 
     def parse_company_profile(self, response):
         self.logger.info(f"Parsing company profile: {response.url}")
@@ -291,7 +330,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 if phone_match:
                     phone_from_linkedin = phone_match.group(0)
                     self.logger.info(f"✅ Found phone on LinkedIn: {phone_from_linkedin}")
-                    break
+                break
         
         email_selectors = [
             'a[href^="mailto:"]::attr(href)',
@@ -313,9 +352,10 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 if email_from_linkedin:
                     self.logger.info(f"✅ Found email on LinkedIn: {email_from_linkedin}")
                     break
-        
+
         # Company Details Block - Modern LinkedIn structure
         website = None
+        visible_text = ""  # Initialize for use in sector filtering
         try:
             # Website - More specific selectors including About page structure
             website_selectors = [
@@ -346,8 +386,11 @@ class SectorBasedScraperSpider(scrapy.Spider):
             visible_text = " ".join([t.strip() for t in visible_text_elements if t.strip() and len(t.strip()) < 500])
             
             # More specific selectors for LinkedIn's current structure
-            # Industry
+            # Industry (Sektör) - Check both English and Turkish
             industry_selectors = [
+                "dt:contains('Sektör') + dd::text",  # Turkish: "Sektör"
+                "dt:contains('Industry') + dd::text",  # English: "Industry"
+                ".org-top-card-summary-info-list__item:contains('Sektör')::text",
                 ".org-top-card-summary-info-list__item:contains('Industry')::text",
                 ".core-section-container__content:contains('Industry')::text",
             ]
@@ -355,9 +398,13 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 try:
                     items = response.css(selector).getall()
                     for item in items:
-                        if 'industry' in item.lower() and len(item.strip()) < 200:
-                            industry = re.sub(r'Industry[:\s]*', '', item, flags=re.IGNORECASE).strip()
-                            if industry and industry != "not-found":
+                        if item and item.strip():
+                            # Remove labels like "Sektör:", "Industry:"
+                            industry_text = re.sub(r'(Sektör|Industry)[:\s]*', '', item, flags=re.IGNORECASE).strip()
+                            if industry_text and len(industry_text) < 200 and industry_text != "not-found":
+                                # Filter out JSON-like content
+                                if '$recipeTypes' not in industry_text and 'entityUrn' not in industry_text:
+                                    industry = industry_text
                                 break
                     if industry != "not-found":
                         break
@@ -366,7 +413,11 @@ class SectorBasedScraperSpider(scrapy.Spider):
             
             # If not found, try regex on visible text (filtered)
             if industry == "not-found" and visible_text:
-                industry_match = re.search(r'Industry[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                # Try Turkish first
+                industry_match = re.search(r'Sektör[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                if not industry_match:
+                    # Try English
+                    industry_match = re.search(r'Industry[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
                 if industry_match:
                     industry = industry_match.group(1).strip()
                     # Filter out JSON-like content
@@ -440,9 +491,92 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     specialties = specialties_match.group(1).strip()
                     if '$recipeTypes' in specialties or 'entityUrn' in specialties:
                         specialties = "not-found"
-            
+
         except Exception as e:
             self.logger.warning(f"Error parsing company details for {response.url}: {e}")
+        
+        # Filter by sector/industry match - TEMPORARILY DISABLED FOR TESTING
+        # TODO: Re-enable sector filtering after testing
+        if False:  # Temporarily disabled
+            # Normalize both the requested sector and found industry for comparison
+            if industry != "not-found" and self.sector:
+                # Normalize: lowercase, remove extra spaces
+                requested_sector_normalized = self.sector.lower().strip()
+                found_industry_normalized = industry.lower().strip()
+                
+                # Get all possible keywords for the requested sector
+                sector_keywords = [requested_sector_normalized]
+                
+                # Add mapped keywords if sector has a mapping
+                if requested_sector_normalized in self.SECTOR_MAPPINGS:
+                    sector_keywords.extend(self.SECTOR_MAPPINGS[requested_sector_normalized])
+                else:
+                    # Try to find partial match in mappings
+                    for key, values in self.SECTOR_MAPPINGS.items():
+                        if requested_sector_normalized in values or any(
+                            req_word in key or req_word in values 
+                            for req_word in requested_sector_normalized.split()
+                        ):
+                            sector_keywords.extend(values)
+                            break
+                
+                # Also add individual words from requested sector
+                sector_keywords.extend(requested_sector_normalized.split())
+                
+                # Remove duplicates and filter short words
+                sector_keywords = list(set([kw for kw in sector_keywords if len(kw) > 2]))
+                
+                # Check if any keyword matches the found industry
+                matches = (
+                    requested_sector_normalized in found_industry_normalized or
+                    found_industry_normalized in requested_sector_normalized or
+                    any(keyword in found_industry_normalized for keyword in sector_keywords)
+                )
+                
+                if not matches:
+                    self.logger.info(f"⏭️  Skipping {company_name}: Industry '{industry}' doesn't match requested sector '{self.sector}'")
+                    self.logger.debug(f"   Requested keywords: {sector_keywords}")
+                    return  # Skip this company
+                else:
+                    self.logger.info(f"✅ Industry match: '{industry}' matches requested sector '{self.sector}'")
+            elif industry == "not-found":
+                # Industry bulunamadı, ama şirket isminde veya açıklamasında sektör var mı kontrol et
+                # Get all possible keywords for the requested sector
+                requested_sector_normalized = self.sector.lower().strip()
+                sector_keywords = [requested_sector_normalized]
+                
+                # Add mapped keywords if sector has a mapping
+                if requested_sector_normalized in self.SECTOR_MAPPINGS:
+                    sector_keywords.extend(self.SECTOR_MAPPINGS[requested_sector_normalized])
+                else:
+                    # Try to find partial match in mappings
+                    for key, values in self.SECTOR_MAPPINGS.items():
+                        if requested_sector_normalized in values or any(
+                            req_word in key or req_word in values 
+                            for req_word in requested_sector_normalized.split()
+                        ):
+                            sector_keywords.extend(values)
+                            break
+                
+                # Also add individual words from requested sector
+                sector_keywords.extend(requested_sector_normalized.split())
+                sector_keywords = list(set([kw for kw in sector_keywords if len(kw) > 2]))
+                
+                # Check company name and visible text for sector keywords
+                # Use response.text as fallback if visible_text is empty
+                searchable_text = visible_text if visible_text else (response.text[:5000].lower() if response.text else "")
+                company_text = f"{company_name} {searchable_text}".lower()
+                if any(keyword in company_text for keyword in sector_keywords):
+                    self.logger.info(f"⚠️  Industry not found but sector keywords found in company info, proceeding")
+                else:
+                    self.logger.warning(f"⚠️  Could not extract industry for {company_name} and no sector keywords found, skipping")
+                    return
+        
+        # Log industry info for debugging (even when filtering is disabled)
+        if industry != "not-found":
+            self.logger.debug(f"📊 {company_name}: Industry='{industry}' (filtering disabled)")
+        else:
+            self.logger.debug(f"📊 {company_name}: Industry not found (filtering disabled, proceeding)")
         
         # If we have phone/email from LinkedIn, use them; otherwise scrape website
         if phone_from_linkedin or email_from_linkedin:
