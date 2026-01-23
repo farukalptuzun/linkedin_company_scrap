@@ -12,21 +12,35 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEED_EXPORT_ENCODING = "utf-8"
 
 # Be polite / reduce ban risk
-DOWNLOAD_DELAY = 3
+DOWNLOAD_DELAY = 2
 RANDOMIZE_DOWNLOAD_DELAY = True
 CONCURRENT_REQUESTS = 4
 
-# HTTP 999 (LinkedIn rate limit) için retry
-RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429, 999]
+# Retry settings
+RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
 RETRY_TIMES = 3
 RETRY_PRIORITY_ADJUST = -1
 
-# Single pipeline entry point
+# MongoDB settings (can be overridden by environment variables)
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+MONGO_DB = os.getenv('MONGO_DB', 'leads_db')
+MONGO_COLLECTION = os.getenv('MONGO_COLLECTION', 'company_leads')
+
+# Google Places API settings
+GOOGLE_PLACES_API_KEY = os.getenv('GOOGLE_PLACES_API_KEY', '')
+
+# Pipeline configuration - MongoDB pipeline active
 ITEM_PIPELINES = {
-    "company_data_scraper.pipelines.CompanyDataScraperPipeline": 300,
+    "company_data_scraper.pipelines.MongoPipeline": 300,
 }
 
-# Selenium middleware for JavaScript-rendered pages
+# Selenium middleware enabled for LinkedIn scraping
+# (Required for LinkedIn scraping with cookie support)
 DOWNLOADER_MIDDLEWARES = {
     "company_data_scraper.middlewares.SeleniumMiddleware": 543,
 }

@@ -1,19 +1,47 @@
 import re
 import scrapy
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
+from datetime import datetime
+from company_data_scraper.items import LeadItem
 
 
 class SectorBasedScraperSpider(scrapy.Spider):
     """
     Scrapes LinkedIn company profiles by first finding companies via a sector keyword search,
-    then visiting each company profile and extracting profile details.
+    then visiting each company profile and extracting profile details including contact information.
     """
 
     name = "sector_based_scraper"
+    
+    # Email regex pattern (matches most common email formats)
+    EMAIL_PATTERN = re.compile(
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    )
+    
+    # Phone regex pattern (matches various phone formats)
+    PHONE_PATTERN = re.compile(
+        r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}'
+    )
+    
+    # Common contact/about page paths to check
+    CONTACT_PATHS = [
+        '/',
+        '/contact',
+        '/iletisim',
+        '/about',
+        '/hakkimizda',
+        '/support',
+        '/contacts',
+        '/iletisim-bilgileri',
+        '/contact-us',
+        '/bize-ulasin',
+    ]
 
-    def __init__(self, sector: str = "", max_pages: str = "3", *args, **kwargs):
+    def __init__(self, sector: str = "", location: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sector = (sector or "").strip()
+        self.location = (location or "").strip()
+        
         if not self.sector:
             raise ValueError("sector is required. Example: scrapy crawl sector_based_scraper -a sector='Technology'")
 
@@ -21,13 +49,27 @@ class SectorBasedScraperSpider(scrapy.Spider):
             self.max_pages = max(1, int(max_pages))
         except Exception:
             self.max_pages = 3
+            
+        try:
+            self.limit = max(1, int(limit))
+        except Exception:
+            self.limit = 20
 
         self._seen_company_urls: set[str] = set()
+        self.processed_count = 0
+        # Track companies being scraped (website -> company data)
+        self.companies_in_progress = {}
 
     def start_requests(self):
         # Try direct LinkedIn access first, fallback to Google Cache if needed
         encoded_sector = quote_plus(self.sector)
         search_url = f"https://www.linkedin.com/search/results/companies/?keywords={encoded_sector}"
+        
+        # Add location to search URL if provided
+        if self.location:
+            encoded_location = quote_plus(self.location)
+            search_url += f"&location={encoded_location}"
+        
         cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
         # Try direct LinkedIn first (better for JavaScript-rendered content)
@@ -110,17 +152,33 @@ class SectorBasedScraperSpider(scrapy.Spider):
             self.logger.debug(f"Response body preview (first 500 chars): {response.text[:500]}")
 
         for company_url in normalized_urls:
+            # Check limit before processing more companies
+            if self.processed_count >= self.limit:
+                self.logger.info(f"Reached limit of {self.limit} companies")
+                return
+                
             if company_url in self._seen_company_urls:
+                self.logger.debug(f"Skipping duplicate URL: {company_url}")
                 continue
             self._seen_company_urls.add(company_url)
+            
+            # Try to get the about page first (has more contact info)
+            # Convert /company/name/ to /company/name/about/
+            about_url = company_url
+            if not company_url.endswith('/about/'):
+                about_url = company_url.rstrip('/') + '/about/'
+            
+            self.logger.info(f"🔍 Requesting company profile: {about_url}")
             yield scrapy.Request(
-                url=company_url,
+                url=about_url,
                 callback=self.parse_company_profile,
-                meta={"sector": self.sector, "company_url": company_url},
+                meta={"sector": self.sector, "location": self.location, "company_url": company_url},
+                errback=self.handle_company_profile_error,
             )
 
         # Try pagination: LinkedIn typically supports `page=` in the query for some UIs.
-        if page <= self.max_pages and normalized_urls:  # Only paginate if we found results
+        # Only paginate if we haven't reached the limit and found results
+        if page <= self.max_pages and normalized_urls and self.processed_count < self.limit:
             next_page = page + 1
             use_cache = response.meta.get("use_cache", False)
             
@@ -157,6 +215,13 @@ class SectorBasedScraperSpider(scrapy.Spider):
             )
 
     def parse_company_profile(self, response):
+        self.logger.info(f"Parsing company profile: {response.url}")
+        
+        # Check limit before processing
+        if self.processed_count >= self.limit:
+            self.logger.info(f"Limit reached ({self.limit}), skipping: {response.url}")
+            return
+        
         # Login sayfası kontrolü - daha kapsamlı
         response_text_lower = response.text.lower() if response.text else ""
         if ('authwall' in response.url.lower() or 'login' in response.url.lower() or 
@@ -173,9 +238,9 @@ class SectorBasedScraperSpider(scrapy.Spider):
             self.logger.error(f"💡 Cookie'leri yenileyin: python3 setup_linkedin_login.py")
             return
         
-        company_item = {}
-        company_item["sector_query"] = response.meta.get("sector", self.sector)
-        company_item["company_linkedin_url"] = response.meta.get("company_url", response.url)
+        sector = response.meta.get("sector", self.sector)
+        location = response.meta.get("location", self.location)
+        company_url = response.meta.get("company_url", response.url)
 
         # Company Name - Multiple fallback selectors for LinkedIn's different layouts
         company_name = None
@@ -194,173 +259,67 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 company_name = name.strip()
                 break
         
-        company_item["company_name"] = company_name or "not-found"
-
-        # LinkedIn Followers Count - Multiple selectors (support Turkish "takipçi" too)
-        followers_text = None
-        followers_selectors = [
-            '//p[contains(text(), "takipçi")]//text()',  # Turkish "takipçi"
-            '//p[contains(text(), "followers")]//text()',  # English "followers"
-            '//span[contains(text(), "takipçi")]//text()',
-            '//span[contains(text(), "followers")]//text()',
-            '//h3[contains(@class, "top-card-layout__first-subline")]/span/following-sibling::text()',
-            '//span[contains(@class, "org-top-card-summary-info-list__item")]//text()[contains(., "followers")]',
-            '.org-top-card-summary-info-list__item::text',
-        ]
-        for selector in followers_selectors:
-            if selector.startswith('//'):
-                texts = response.xpath(selector).getall()
-                for text in texts:
-                    if text and ('follower' in text.lower() or 'takipçi' in text.lower()):
-                        followers_text = text
-                        break
-            else:
-                texts = response.css(selector).getall()
-                for text in texts:
-                    if text and ('follower' in text.lower() or 'takipçi' in text.lower()):
-                        followers_text = text
-                        break
-            if followers_text:
-                break
+        company_name = company_name or None
         
-        if followers_text:
-            try:
-                # Extract number from text like "140K followers", "1.2M followers", "140 B takipçi" (Turkish)
-                # Handle Turkish format: "140 B takipçi" = 140 Billion
-                followers_text_clean = followers_text.replace(',', '').replace('.', '')
-                numbers = re.findall(r'(\d+)\s*([KMB]|Mn|B|Milyon)', followers_text_clean, re.IGNORECASE)
-                if not numbers:
-                    # Try simple number extraction
-                    numbers = re.findall(r'[\d.]+[KMB]?', followers_text.replace(',', ''))
-                
-                if numbers:
-                    if isinstance(numbers[0], tuple):
-                        num_str = numbers[0][0]
-                        unit = numbers[0][1].upper()
-                    else:
-                        num_str = numbers[0].upper()
-                        unit = ''
-                        if 'K' in num_str:
-                            unit = 'K'
-                            num_str = num_str.replace('K', '')
-                        elif 'M' in num_str and 'MN' not in num_str.upper():
-                            unit = 'M'
-                            num_str = num_str.replace('M', '')
-                        elif 'B' in num_str:
-                            unit = 'B'
-                            num_str = num_str.replace('B', '')
-                    
-                    num_value = float(num_str)
-                    if unit == 'K' or unit == '':
-                        company_item["linkedin_followers_count"] = int(num_value * 1000)
-                    elif unit == 'M' or unit == 'MN' or 'milyon' in followers_text.lower():
-                        company_item["linkedin_followers_count"] = int(num_value * 1000000)
-                    elif unit == 'B' or 'b' in unit.lower():
-                        company_item["linkedin_followers_count"] = int(num_value * 1000000000)
-                    else:
-                        company_item["linkedin_followers_count"] = int(num_value)
+        if not company_name or company_name == "not-found":
+            self.logger.warning(f"Could not extract company name from {response.url}")
+            self.logger.debug(f"Response status: {response.status}, URL: {response.url}")
+            self.logger.debug(f"Response body preview (first 1000 chars): {response.text[:1000] if response.text else 'No text'}")
+            return
+
+        # Extract phone and email from LinkedIn profile (if available)
+        phone_from_linkedin = None
+        email_from_linkedin = None
+        
+        # Try to find phone/email in LinkedIn profile
+        # Check both main page and about page structure
+        phone_selectors = [
+            'a[href^="tel:"]::attr(href)',  # tel:+902162322230
+            'a[href^="tel:"] span::text',   # Text inside tel: link
+            'dd a[href^="tel:"]::attr(href)',  # About page structure
+            'dd a[href^="tel:"] span::text',
+            '.org-top-card-summary-info-list__item:contains("phone")::text',
+            '.org-top-card-summary-info-list__item:contains("Phone")::text',
+        ]
+        for selector in phone_selectors:
+            phone_text = response.css(selector).get()
+            if phone_text:
+                # Remove tel: prefix if present
+                phone_text = phone_text.replace('tel:', '').strip()
+                # Extract phone from tel: link or text
+                phone_match = self.PHONE_PATTERN.search(phone_text)
+                if phone_match:
+                    phone_from_linkedin = phone_match.group(0)
+                    self.logger.info(f"✅ Found phone on LinkedIn: {phone_from_linkedin}")
+                    break
+        
+        email_selectors = [
+            'a[href^="mailto:"]::attr(href)',
+            'a[href^="mailto:"]::text',
+            'dd a[href^="mailto:"]::attr(href)',  # About page structure
+            'dd a[href^="mailto:"] span::text',
+            '.org-top-card-summary-info-list__item:contains("@")::text',
+        ]
+        for selector in email_selectors:
+            email_text = response.css(selector).get()
+            if email_text:
+                # Extract email from mailto: link or text
+                if email_text.startswith('mailto:'):
+                    email_from_linkedin = email_text.replace('mailto:', '').strip()
                 else:
-                    # Try to extract just numbers
-                    num_match = re.search(r'(\d+[\d,\.]*)', followers_text.replace(',', ''))
-                    if num_match:
-                        company_item["linkedin_followers_count"] = int(float(num_match.group(1)))
-                    else:
-                        company_item["linkedin_followers_count"] = followers_text.strip()
-            except Exception as e:
-                self.logger.debug(f"Error parsing followers count: {e}")
-                company_item["linkedin_followers_count"] = "not-found"
-        else:
-            company_item["linkedin_followers_count"] = "not-found"
-
-        # Company Logo URL - Multiple selectors
-        logo_url = None
-        logo_selectors = [
-            "div.top-card-layout__entity-image-container img::attr(data-delayed-url)",
-            "div.top-card-layout__entity-image-container img::attr(src)",
-            ".org-top-card-primary-content__logo img::attr(src)",
-            ".org-top-card-primary-content__logo img::attr(data-delayed-url)",
-            "img.org-top-card-primary-content__logo::attr(src)",
-        ]
-        for selector in logo_selectors:
-            url = response.css(selector).get()
-            if url and url.strip() and url != "not-found":
-                logo_url = url.strip()
-                break
-        company_item["company_logo_url"] = logo_url or "not-found"
-
-        # About Us - Multiple selectors (filter JSON data)
-        about_text = None
-        about_selectors = [
-            ".core-section-container__content p::text",
-            ".org-about-us-organization-description__text::text",
-            ".break-words p::text",
-            "section[data-test-id='about-us'] p::text",
-            ".about-us__description p::text",
-        ]
-        for selector in about_selectors:
-            texts = response.css(selector).getall()
-            for text in texts:
-                if text and text.strip() and len(text.strip()) > 10:
-                    # Filter out JSON-like content
-                    if '$recipeTypes' not in text and 'entityUrn' not in text and len(text.strip()) < 2000:
-                        about_text = text.strip()
-                        break
-            if about_text:
-                break
+                    email_match = self.EMAIL_PATTERN.search(email_text)
+                    if email_match:
+                        email_from_linkedin = email_match.group(0)
+                if email_from_linkedin:
+                    self.logger.info(f"✅ Found email on LinkedIn: {email_from_linkedin}")
+                    break
         
-        # If single selector didn't work, try getting all paragraphs (filtered)
-        if not about_text or about_text == "not-found":
-            all_paragraphs = response.css(".core-section-container__content p::text").getall()
-            if all_paragraphs:
-                filtered_paragraphs = [
-                    p.strip() for p in all_paragraphs 
-                    if p.strip() and '$recipeTypes' not in p and 'entityUrn' not in p and len(p.strip()) < 2000
-                ]
-                if filtered_paragraphs:
-                    about_text = " ".join(filtered_paragraphs[:3])  # Max 3 paragraphs
-        
-        company_item["about_us"] = about_text or "not-found"
-
-        # Number of Employees - Multiple selectors
-        employees = None
-        employee_selectors = [
-            "a.face-pile__cta::text",
-            ".org-top-card-summary-info-list__item::text",
-            '//span[contains(text(), "employees")]//text()',
-            '//a[contains(@href, "employees")]//text()',
-        ]
-        for selector in employee_selectors:
-            if selector.startswith('//'):
-                raw = response.xpath(selector).get()
-            else:
-                raw = response.css(selector).get()
-            if raw and 'employee' in raw.lower():
-                employees = raw
-                break
-        
-        if employees:
-            try:
-                match = re.findall(r"\d{1,3}(?:,\d{3})*(?:[KMB])?", employees.replace(',', ''))
-                if match:
-                    num_str = match[0].upper()
-                    if 'K' in num_str:
-                        company_item["num_of_employees"] = int(float(num_str.replace('K', '')) * 1000)
-                    elif 'M' in num_str:
-                        company_item["num_of_employees"] = int(float(num_str.replace('M', '')) * 1000000)
-                    else:
-                        company_item["num_of_employees"] = int(num_str.replace(',', ''))
-                else:
-                    company_item["num_of_employees"] = employees.strip()
-            except Exception:
-                company_item["num_of_employees"] = employees.strip()
-        else:
-            company_item["num_of_employees"] = "not-found"
-
         # Company Details Block - Modern LinkedIn structure
+        website = None
         try:
-            # Website - More specific selectors
-            website = None
+            # Website - More specific selectors including About page structure
             website_selectors = [
+                "dd a[href^='http']::attr(href)",  # About page: <dd><a href="https://...">
                 ".org-top-card-summary-info-list__item a[href^='http']::attr(href)",
                 ".core-section-container__content a[href^='http']::attr(href)",
                 "a[data-test-id='website']::attr(href)",
@@ -369,8 +328,8 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 url = response.css(selector).get()
                 if url and url.strip() and url.startswith('http') and 'linkedin.com' not in url:
                     website = url.strip()
+                    self.logger.info(f"✅ Found website: {website}")
                     break
-            company_item["website"] = website or "not-found"
 
             # Industry, Size, Headquarters, Type, Founded, Specialties
             # Use more specific selectors to avoid JSON data
@@ -482,52 +441,180 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     if '$recipeTypes' in specialties or 'entityUrn' in specialties:
                         specialties = "not-found"
             
-            company_item["industry"] = industry
-            company_item["company_size_approx"] = company_size
-            company_item["headquarters"] = headquarters
-            company_item["type"] = company_type
-            company_item["founded"] = founded
-            company_item["specialties"] = specialties
-
-            # Funding fields (best-effort)
-            funding_text = response.css("p.text-display-lg::text").get()
-            company_item["funding"] = funding_text.strip() if funding_text else "not-found"
-
-            rounds_text = response.xpath(
-                '//section[contains(@class, "aside-section-container")]/div/a[contains(@class, "link-styled")]//span[contains(@class, "before:middot")]/text()'
-            ).get()
-            if rounds_text:
-                try:
-                    company_item["funding_total_rounds"] = int(rounds_text.strip().split()[0])
-                except Exception:
-                    company_item["funding_total_rounds"] = rounds_text.strip()
-            else:
-                company_item["funding_total_rounds"] = "not-found"
-
-            company_item["funding_option"] = response.xpath(
-                '//section[contains(@class, "aside-section-container")]/div//div[contains(@class, "my-2")]/a[contains(@class, "link-styled")]/text()'
-            ).get(default="not-found").strip()
-
-            company_item["last_funding_round"] = response.xpath(
-                '//section[contains(@class, "aside-section-container")]/div//div[contains(@class, "my-2")]/a[contains(@class, "link-styled")]//time[contains(@class, "before:middot")]/text()'
-            ).get(default="not-found").strip()
-
         except Exception as e:
             self.logger.warning(f"Error parsing company details for {response.url}: {e}")
-            # Keep partial item if the page layout differs.
-            company_item.setdefault("website", "not-found")
-            company_item.setdefault("industry", "not-found")
-            company_item.setdefault("company_size_approx", "not-found")
-            company_item.setdefault("headquarters", "not-found")
-            company_item.setdefault("type", "not-found")
-            company_item.setdefault("founded", "not-found")
-            company_item.setdefault("specialties", "not-found")
-            company_item.setdefault("funding", "not-found")
-            company_item.setdefault("funding_total_rounds", "not-found")
-            company_item.setdefault("funding_option", "not-found")
-            company_item.setdefault("last_funding_round", "not-found")
+        
+        # If we have phone/email from LinkedIn, use them; otherwise scrape website
+        if phone_from_linkedin or email_from_linkedin:
+            # We have contact info from LinkedIn, create item directly
+            emails_list = [email_from_linkedin] if email_from_linkedin else []
+            item = LeadItem(
+                sector=sector,
+                location=location,
+                company_name=company_name,
+                phone=phone_from_linkedin or "",
+                emails=emails_list,
+                website=website or None,
+                source='linkedin',
+                created_at=datetime.utcnow(),
+            )
+            self.processed_count += 1
+            self.logger.info(f"[{self.processed_count}/{self.limit}] Found contact info on LinkedIn: {company_name}")
+            yield item
+        elif website and website != "not-found":
+            # No contact info on LinkedIn, scrape website
+            # Normalize website URL
+            if not website.startswith('http'):
+                website = 'https://' + website
+            
+            # Initialize tracking for this company
+            company_key = website
+            self.companies_in_progress[company_key] = {
+                'company_name': company_name,
+                'phone': phone_from_linkedin or "",
+                'website': website,
+                'emails': set([email_from_linkedin] if email_from_linkedin else []),
+                'pages_processed': 0,
+                'total_pages': len(self.CONTACT_PATHS),
+                'sector': sector,
+                'location': location,
+            }
+            
+            # Request multiple pages from the website
+            for path in self.CONTACT_PATHS:
+                url = urljoin(website, path)
+                yield scrapy.Request(
+                    url=url,
+                    callback=self.parse_website_for_contacts,
+                    meta={
+                        'company_key': company_key,
+                        'dont_redirect': True,
+                    },
+                    errback=self.handle_website_error,
+                    dont_filter=False,
+                )
+        else:
+            # No website, yield item with empty contact info
+            item = LeadItem(
+                sector=sector,
+                location=location,
+                company_name=company_name,
+                phone=phone_from_linkedin or "",
+                emails=[email_from_linkedin] if email_from_linkedin else [],
+                website=None,
+                source='linkedin',
+                created_at=datetime.utcnow(),
+            )
+            self.processed_count += 1
+            self.logger.info(f"[{self.processed_count}/{self.limit}] No website found: {company_name}")
+            yield item
 
-        yield company_item
+    def parse_website_for_contacts(self, response):
+        """Extract emails and phone numbers from website pages"""
+        company_key = response.meta.get('company_key')
+        
+        if company_key not in self.companies_in_progress:
+            self.logger.warning(f"Company key {company_key} not found in tracking")
+            return
+        
+        company_data = self.companies_in_progress[company_key]
+        company_data['pages_processed'] += 1
+        
+        # Extract emails from page text
+        page_text = response.text
+        emails_found = set(self.EMAIL_PATTERN.findall(page_text))
+        
+        # Normalize emails (lowercase)
+        emails_found = {email.lower() for email in emails_found}
+        
+        # Filter out common non-email patterns (like image URLs, CSS, JS)
+        emails_found = {
+            email for email in emails_found
+            if not email.startswith('//') and '@' in email
+            and not email.endswith('.png') and not email.endswith('.jpg')
+            and not email.endswith('.gif') and not email.endswith('.css')
+            and not email.endswith('.js')
+        }
+        
+        if emails_found:
+            self.logger.info(f"Found {len(emails_found)} emails on {response.url}")
+            company_data['emails'].update(emails_found)
+        
+        # Extract phone numbers from page text
+        phones_found = self.PHONE_PATTERN.findall(page_text)
+        if phones_found and not company_data['phone']:
+            # Use the first valid phone number found
+            for phone in phones_found:
+                # Clean up phone number
+                phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                if len(phone_clean) >= 10:  # Minimum phone number length
+                    company_data['phone'] = phone_clean
+                    self.logger.info(f"Found phone number on {response.url}: {phone_clean}")
+                    break
+        
+        # Check if all pages have been processed
+        if company_data['pages_processed'] >= company_data['total_pages']:
+            # All pages processed, yield final item
+            item = LeadItem(
+                sector=company_data['sector'],
+                location=company_data['location'],
+                company_name=company_data['company_name'],
+                phone=company_data['phone'],
+                emails=list(company_data['emails']),
+                website=company_data['website'],
+                source='linkedin',
+                created_at=datetime.utcnow(),
+            )
+            self.processed_count += 1
+            self.logger.info(
+                f"[{self.processed_count}/{self.limit}] Completed scraping {company_data['company_name']}: "
+                f"{len(company_data['emails'])} emails, phone: {'Yes' if company_data['phone'] else 'No'}"
+            )
+            # Remove from tracking
+            del self.companies_in_progress[company_key]
+            yield item
+    
+    def handle_company_profile_error(self, failure):
+        """Handle errors when scraping company profile pages"""
+        company_url = failure.request.meta.get('company_url', failure.request.url)
+        self.logger.error(f"Failed to scrape company profile {company_url}: {failure.value}")
+        self.logger.debug(f"Request URL: {failure.request.url}")
+        if hasattr(failure.value, 'response') and failure.value.response:
+            self.logger.debug(f"Response status: {failure.value.response.status}")
+    
+    def handle_website_error(self, failure):
+        """Handle errors when scraping website pages"""
+        company_key = failure.request.meta.get('company_key')
+        
+        if company_key not in self.companies_in_progress:
+            return
+        
+        company_data = self.companies_in_progress[company_key]
+        company_data['pages_processed'] += 1
+        
+        self.logger.warning(f"Failed to scrape {failure.request.url}: {failure.value}")
+        
+        # Check if all pages have been processed (including errors)
+        if company_data['pages_processed'] >= company_data['total_pages']:
+            # All pages processed (with some errors), yield item with what we have
+            item = LeadItem(
+                sector=company_data['sector'],
+                location=company_data['location'],
+                company_name=company_data['company_name'],
+                phone=company_data['phone'],
+                emails=list(company_data['emails']),
+                website=company_data['website'],
+                source='linkedin',
+                created_at=datetime.utcnow(),
+            )
+            self.processed_count += 1
+            self.logger.info(
+                f"[{self.processed_count}/{self.limit}] Completed scraping {company_data['company_name']} "
+                f"(with some errors): {len(company_data['emails'])} emails, phone: {'Yes' if company_data['phone'] else 'No'}"
+            )
+            # Remove from tracking
+            del self.companies_in_progress[company_key]
+            yield item
 
     @staticmethod
     def _extract_company_urls(hrefs: list[str]) -> list[str]:
