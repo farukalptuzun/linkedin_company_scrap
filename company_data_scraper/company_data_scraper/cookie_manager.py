@@ -57,6 +57,60 @@ class LinkedInCookieManager:
         """Cookie'leri döndür"""
         return self.cookies
     
+    def are_cookies_expired(self):
+        """Cookie'lerin expire olup olmadığını kontrol et"""
+        if not self.cookies:
+            return True
+        
+        current_time = int(time.time())
+        # En önemli cookie'lerden birini kontrol et (li_at genelde en uzun süreli)
+        for cookie in self.cookies:
+            if cookie.get('name') == 'li_at':
+                expiry = cookie.get('expiry', 0)
+                # Expire olmadan 1 gün kala uyarı ver
+                if expiry > 0 and expiry < current_time + 86400:
+                    return True
+                break
+        
+        return False
+    
+    def check_and_refresh_cookies(self, auto_refresh: bool = False):
+        """
+        Cookie'leri kontrol et ve gerekirse yenile
+        auto_refresh=True: Expire olmuşsa otomatik yenilemeyi dene
+        """
+        if not self.load_cookies():
+            return False
+        
+        if self.are_cookies_expired():
+            if auto_refresh:
+                print("🔄 Cookie'ler expire olmuş, otomatik yenileme deneniyor...")
+                return self.auto_refresh_cookies()
+            else:
+                print("⚠️  Cookie'ler expire olmuş veya expire olmak üzere!")
+                return False
+        
+        return True
+    
+    def auto_refresh_cookies(self):
+        """
+        Cookie'leri otomatik yenile (headless modda)
+        Not: LinkedIn'in bot detection'ı nedeniyle tam otomasyon zor olabilir
+        """
+        print("🔄 Otomatik cookie yenileme başlatılıyor...")
+        try:
+            # Headless modda yenileme dene
+            result = self.setup_login(headless=True)
+            if result:
+                print("✅ Cookie'ler otomatik olarak yenilendi!")
+                return True
+            else:
+                print("⚠️  Otomatik yenileme başarısız. Manuel yenileme gerekebilir.")
+                return False
+        except Exception as e:
+            print(f"❌ Otomatik yenileme hatası: {e}")
+            return False
+    
     def setup_login(self, headless: bool = False):
         """
         İlk kurulum: LinkedIn'e login yap ve cookie'leri kaydet
@@ -64,13 +118,16 @@ class LinkedInCookieManager:
         """
         print("\n🔐 LinkedIn Login Kurulumu")
         print("=" * 50)
-        print("Chrome açılacak, LinkedIn'e login yapın.")
-        print("Login tamamlandıktan sonra bu pencereyi kapatabilirsiniz.")
+        if headless:
+            print("Headless modda otomatik yenileme deneniyor...")
+        else:
+            print("Chrome açılacak, LinkedIn'e login yapın.")
+            print("Login tamamlandıktan sonra bu pencereyi kapatabilirsiniz.")
         print("=" * 50)
         
         chrome_options = Options()
         if headless:
-            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--window-size=1920,1080')
@@ -109,6 +166,8 @@ class LinkedInCookieManager:
             else:
                 # Headless modda biraz bekle (login için zaman tanı)
                 print("⏳ Headless modda 60 saniye bekleniyor...")
+                print("⚠️  Not: Headless modda otomatik login zor olabilir.")
+                print("    Manuel login için headless=False kullanın.")
                 time.sleep(60)
             
             # Ana sayfaya git (login başarılıysa)

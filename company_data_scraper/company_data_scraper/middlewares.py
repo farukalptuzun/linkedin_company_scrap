@@ -142,7 +142,9 @@ class SeleniumMiddleware:
             
             # Cookie yöneticisini başlat
             self.cookie_manager = LinkedInCookieManager()
-            cookies_loaded = self.cookie_manager.load_cookies()
+            
+            # Cookie'leri kontrol et ve gerekirse yenile
+            cookies_loaded = self.cookie_manager.check_and_refresh_cookies(auto_refresh=True)
             
             # Try to use webdriver-manager for automatic driver management
             try:
@@ -213,15 +215,51 @@ class SeleniumMiddleware:
         if is_search_page or is_company_profile:
             try:
                 import time
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                from selenium.webdriver.common.by import By
+                
                 self.driver.get(request.url)
-                time.sleep(3)  # Sayfanın yüklenmesini bekle
+                # Wait for page to load - check for main content
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.TAG_NAME, "body"))
+                    )
+                except:
+                    pass
+                time.sleep(5)  # Extra wait for JavaScript to render content
                 
                 # Login sayfasına yönlendirilmiş mi kontrol et
-                if 'login' in self.driver.current_url.lower():
+                if 'login' in self.driver.current_url.lower() or 'authwall' in self.driver.current_url.lower():
                     spider.logger.error("❌ LinkedIn login sayfasına yönlendirildi. Cookie'ler expire olmuş olabilir.")
-                    spider.logger.error("💡 Çözüm: python3 setup_linkedin_login.py çalıştırın")
-                    return None
-                
+                    
+                    # Otomatik yenileme dene
+                    spider.logger.info("🔄 Otomatik cookie yenileme deneniyor...")
+                    if self.cookie_manager.auto_refresh_cookies():
+                        # Yenilenen cookie'leri yükle
+                        cookies = self.cookie_manager.get_cookies()
+                        self.driver.get("https://www.linkedin.com")
+                        time.sleep(1)
+                        for cookie in cookies:
+                            try:
+                                if 'expiry' in cookie and cookie['expiry'] > 2147483647:
+                                    cookie['expiry'] = int(time.time()) + 86400
+                                self.driver.add_cookie(cookie)
+                            except:
+                                pass
+                        
+                        # Tekrar dene
+                        self.driver.get(request.url)
+                        time.sleep(3)
+                        
+                        if 'login' in self.driver.current_url.lower() or 'authwall' in self.driver.current_url.lower():
+                            spider.logger.error("💡 Otomatik yenileme başarısız. Manuel yenileme gerekli: python3 setup_linkedin_login.py")
+                            return None
+                        else:
+                            spider.logger.info("✅ Cookie'ler yenilendi ve sayfa yüklendi!")
+                    else:
+                        spider.logger.error("💡 Çözüm: python3 setup_linkedin_login.py çalıştırın")
+                        return None
                 # Sayfa kaynağını al
                 body = self.driver.page_source.encode('utf-8')
                 

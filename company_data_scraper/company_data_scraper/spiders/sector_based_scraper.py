@@ -120,7 +120,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             )
 
         # Try pagination: LinkedIn typically supports `page=` in the query for some UIs.
-        if page < self.max_pages and normalized_urls:  # Only paginate if we found results
+        if page <= self.max_pages and normalized_urls:  # Only paginate if we found results
             next_page = page + 1
             use_cache = response.meta.get("use_cache", False)
             
@@ -148,7 +148,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 },
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Language": "en-US,en;q=0.5", 
                     "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
                     "Upgrade-Insecure-Requests": "1",
@@ -157,14 +157,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
             )
 
     def parse_company_profile(self, response):
-        # Login sayfası kontrolü
-        if 'authwall' in response.url.lower() or 'login' in response.url.lower():
+        # Login sayfası kontrolü - daha kapsamlı
+        response_text_lower = response.text.lower() if response.text else ""
+        if ('authwall' in response.url.lower() or 'login' in response.url.lower() or 
+            'authwall' in response_text_lower or 'sign in' in response_text_lower[:2000] or
+            'join linkedin' in response_text_lower[:2000]):
             self.logger.error(f"❌ Login sayfasına yönlendirildi: {response.url}")
             self.logger.error(f"💡 Cookie'ler expire olmuş olabilir. Cookie'leri yenileyin: python3 setup_linkedin_login.py")
             return
         
         # Sayfa içeriğinde login formu var mı kontrol et
-        if response.css('form[action*="login"]') or response.css('.authwall-sign-in-form'):
+        if (response.css('form[action*="login"]') or response.css('.authwall-sign-in-form') or
+            response.css('#username') or response.css('#password')):
             self.logger.error(f"❌ Login formu tespit edildi: {response.url}")
             self.logger.error(f"💡 Cookie'leri yenileyin: python3 setup_linkedin_login.py")
             return
@@ -173,83 +177,321 @@ class SectorBasedScraperSpider(scrapy.Spider):
         company_item["sector_query"] = response.meta.get("sector", self.sector)
         company_item["company_linkedin_url"] = response.meta.get("company_url", response.url)
 
-        company_item["company_name"] = (
-            response.css(".top-card-layout__entity-info h1::text").get(default="not-found").strip()
-        )
+        # Company Name - Multiple fallback selectors for LinkedIn's different layouts
+        company_name = None
+        name_selectors = [
+            ".top-card-layout__entity-info h1::text",
+            "h1.org-top-card-summary__title::text",
+            "h1.text-heading-xlarge::text",
+            "h1[data-test-id='org-name']::text",
+            "h1::text",
+            ".org-top-card-summary-info__primary-text::text",
+            "h1.top-card-layout__title::text",
+        ]
+        for selector in name_selectors:
+            name = response.css(selector).get()
+            if name and name.strip() and name.strip() != "not-found":
+                company_name = name.strip()
+                break
+        
+        company_item["company_name"] = company_name or "not-found"
 
-        followers_text = response.xpath(
-            '//h3[contains(@class, "top-card-layout__first-subline")]/span/following-sibling::text()'
-        ).get()
+        # LinkedIn Followers Count - Multiple selectors (support Turkish "takipçi" too)
+        followers_text = None
+        followers_selectors = [
+            '//p[contains(text(), "takipçi")]//text()',  # Turkish "takipçi"
+            '//p[contains(text(), "followers")]//text()',  # English "followers"
+            '//span[contains(text(), "takipçi")]//text()',
+            '//span[contains(text(), "followers")]//text()',
+            '//h3[contains(@class, "top-card-layout__first-subline")]/span/following-sibling::text()',
+            '//span[contains(@class, "org-top-card-summary-info-list__item")]//text()[contains(., "followers")]',
+            '.org-top-card-summary-info-list__item::text',
+        ]
+        for selector in followers_selectors:
+            if selector.startswith('//'):
+                texts = response.xpath(selector).getall()
+                for text in texts:
+                    if text and ('follower' in text.lower() or 'takipçi' in text.lower()):
+                        followers_text = text
+                        break
+            else:
+                texts = response.css(selector).getall()
+                for text in texts:
+                    if text and ('follower' in text.lower() or 'takipçi' in text.lower()):
+                        followers_text = text
+                        break
+            if followers_text:
+                break
+        
         if followers_text:
             try:
-                company_item["linkedin_followers_count"] = int(
-                    followers_text.split()[0].strip().replace(",", "")
-                )
-            except Exception:
-                company_item["linkedin_followers_count"] = followers_text.strip()
+                # Extract number from text like "140K followers", "1.2M followers", "140 B takipçi" (Turkish)
+                # Handle Turkish format: "140 B takipçi" = 140 Billion
+                followers_text_clean = followers_text.replace(',', '').replace('.', '')
+                numbers = re.findall(r'(\d+)\s*([KMB]|Mn|B|Milyon)', followers_text_clean, re.IGNORECASE)
+                if not numbers:
+                    # Try simple number extraction
+                    numbers = re.findall(r'[\d.]+[KMB]?', followers_text.replace(',', ''))
+                
+                if numbers:
+                    if isinstance(numbers[0], tuple):
+                        num_str = numbers[0][0]
+                        unit = numbers[0][1].upper()
+                    else:
+                        num_str = numbers[0].upper()
+                        unit = ''
+                        if 'K' in num_str:
+                            unit = 'K'
+                            num_str = num_str.replace('K', '')
+                        elif 'M' in num_str and 'MN' not in num_str.upper():
+                            unit = 'M'
+                            num_str = num_str.replace('M', '')
+                        elif 'B' in num_str:
+                            unit = 'B'
+                            num_str = num_str.replace('B', '')
+                    
+                    num_value = float(num_str)
+                    if unit == 'K' or unit == '':
+                        company_item["linkedin_followers_count"] = int(num_value * 1000)
+                    elif unit == 'M' or unit == 'MN' or 'milyon' in followers_text.lower():
+                        company_item["linkedin_followers_count"] = int(num_value * 1000000)
+                    elif unit == 'B' or 'b' in unit.lower():
+                        company_item["linkedin_followers_count"] = int(num_value * 1000000000)
+                    else:
+                        company_item["linkedin_followers_count"] = int(num_value)
+                else:
+                    # Try to extract just numbers
+                    num_match = re.search(r'(\d+[\d,\.]*)', followers_text.replace(',', ''))
+                    if num_match:
+                        company_item["linkedin_followers_count"] = int(float(num_match.group(1)))
+                    else:
+                        company_item["linkedin_followers_count"] = followers_text.strip()
+            except Exception as e:
+                self.logger.debug(f"Error parsing followers count: {e}")
+                company_item["linkedin_followers_count"] = "not-found"
         else:
             company_item["linkedin_followers_count"] = "not-found"
 
-        company_item["company_logo_url"] = response.css(
-            "div.top-card-layout__entity-image-container img::attr(data-delayed-url)"
-        ).get("not-found")
+        # Company Logo URL - Multiple selectors
+        logo_url = None
+        logo_selectors = [
+            "div.top-card-layout__entity-image-container img::attr(data-delayed-url)",
+            "div.top-card-layout__entity-image-container img::attr(src)",
+            ".org-top-card-primary-content__logo img::attr(src)",
+            ".org-top-card-primary-content__logo img::attr(data-delayed-url)",
+            "img.org-top-card-primary-content__logo::attr(src)",
+        ]
+        for selector in logo_selectors:
+            url = response.css(selector).get()
+            if url and url.strip() and url != "not-found":
+                logo_url = url.strip()
+                break
+        company_item["company_logo_url"] = logo_url or "not-found"
 
-        company_item["about_us"] = response.css(".core-section-container__content p::text").get(
-            default="not-found"
-        ).strip()
+        # About Us - Multiple selectors (filter JSON data)
+        about_text = None
+        about_selectors = [
+            ".core-section-container__content p::text",
+            ".org-about-us-organization-description__text::text",
+            ".break-words p::text",
+            "section[data-test-id='about-us'] p::text",
+            ".about-us__description p::text",
+        ]
+        for selector in about_selectors:
+            texts = response.css(selector).getall()
+            for text in texts:
+                if text and text.strip() and len(text.strip()) > 10:
+                    # Filter out JSON-like content
+                    if '$recipeTypes' not in text and 'entityUrn' not in text and len(text.strip()) < 2000:
+                        about_text = text.strip()
+                        break
+            if about_text:
+                break
+        
+        # If single selector didn't work, try getting all paragraphs (filtered)
+        if not about_text or about_text == "not-found":
+            all_paragraphs = response.css(".core-section-container__content p::text").getall()
+            if all_paragraphs:
+                filtered_paragraphs = [
+                    p.strip() for p in all_paragraphs 
+                    if p.strip() and '$recipeTypes' not in p and 'entityUrn' not in p and len(p.strip()) < 2000
+                ]
+                if filtered_paragraphs:
+                    about_text = " ".join(filtered_paragraphs[:3])  # Max 3 paragraphs
+        
+        company_item["about_us"] = about_text or "not-found"
 
-        # num_of_employees
-        try:
-            raw = response.css("a.face-pile__cta::text").get(default="not-found").strip()
-            match = re.findall(r"\d{1,3}(?:,\d{3})*", raw)
-            if match:
-                company_item["num_of_employees"] = int(match[0].replace(",", ""))
+        # Number of Employees - Multiple selectors
+        employees = None
+        employee_selectors = [
+            "a.face-pile__cta::text",
+            ".org-top-card-summary-info-list__item::text",
+            '//span[contains(text(), "employees")]//text()',
+            '//a[contains(@href, "employees")]//text()',
+        ]
+        for selector in employee_selectors:
+            if selector.startswith('//'):
+                raw = response.xpath(selector).get()
             else:
-                company_item["num_of_employees"] = raw
-        except Exception:
+                raw = response.css(selector).get()
+            if raw and 'employee' in raw.lower():
+                employees = raw
+                break
+        
+        if employees:
+            try:
+                match = re.findall(r"\d{1,3}(?:,\d{3})*(?:[KMB])?", employees.replace(',', ''))
+                if match:
+                    num_str = match[0].upper()
+                    if 'K' in num_str:
+                        company_item["num_of_employees"] = int(float(num_str.replace('K', '')) * 1000)
+                    elif 'M' in num_str:
+                        company_item["num_of_employees"] = int(float(num_str.replace('M', '')) * 1000000)
+                    else:
+                        company_item["num_of_employees"] = int(num_str.replace(',', ''))
+                else:
+                    company_item["num_of_employees"] = employees.strip()
+            except Exception:
+                company_item["num_of_employees"] = employees.strip()
+        else:
             company_item["num_of_employees"] = "not-found"
 
-        # Company details block (same approach as existing company_profile_scraper spider)
+        # Company Details Block - Modern LinkedIn structure
         try:
-            company_details = response.css(".core-section-container__content .mb-2")
+            # Website - More specific selectors
+            website = None
+            website_selectors = [
+                ".org-top-card-summary-info-list__item a[href^='http']::attr(href)",
+                ".core-section-container__content a[href^='http']::attr(href)",
+                "a[data-test-id='website']::attr(href)",
+            ]
+            for selector in website_selectors:
+                url = response.css(selector).get()
+                if url and url.strip() and url.startswith('http') and 'linkedin.com' not in url:
+                    website = url.strip()
+                    break
+            company_item["website"] = website or "not-found"
 
-            company_item["website"] = company_details[0].css("a::text").get(default="not-found").strip()
-
-            industry_line = company_details[1].css(".text-md::text").getall()
-            company_item["industry"] = industry_line[1].strip() if len(industry_line) > 1 else "not-found"
-
-            size_line = company_details[2].css(".text-md::text").getall()
-            company_item["company_size_approx"] = (
-                size_line[1].strip().split()[0] if len(size_line) > 1 else "not-found"
-            )
-
-            hq_line = company_details[3].css(".text-md::text").getall()
-            if hq_line and hq_line[0].lower().strip() == "headquarters":
-                company_item["headquarters"] = hq_line[1].strip() if len(hq_line) > 1 else "not-found"
-            else:
-                company_item["headquarters"] = "not-found"
-
-            type_line = company_details[4].css(".text-md::text").getall()
-            company_item["type"] = type_line[1].strip() if len(type_line) > 1 else "not-found"
-
-            unsure_param = company_details[5].css(".text-md::text").getall()
-            unsure_key = unsure_param[0].lower().strip() if unsure_param else "unsure_parameter"
-            unsure_val = unsure_param[1].strip() if len(unsure_param) > 1 else "not-found"
-            company_item[unsure_key] = unsure_val
-
-            # founded/specialties normalization
-            if unsure_key == "founded":
-                specialties_line = company_details[6].css(".text-md::text").getall() if len(company_details) > 6 else []
-                if specialties_line and specialties_line[0].lower().strip() == "specialties":
-                    company_item["specialties"] = specialties_line[1].strip() if len(specialties_line) > 1 else "not-found"
-                else:
-                    company_item["specialties"] = "not-found"
-            else:
-                company_item.setdefault("founded", "not-found")
-                company_item.setdefault("specialties", "not-found")
+            # Industry, Size, Headquarters, Type, Founded, Specialties
+            # Use more specific selectors to avoid JSON data
+            industry = "not-found"
+            company_size = "not-found"
+            headquarters = "not-found"
+            company_type = "not-found"
+            founded = "not-found"
+            specialties = "not-found"
+            
+            # Try to get visible text only (exclude script tags and JSON)
+            # Get all visible text from the main content area
+            visible_text_elements = response.css("body *:not(script):not(style)::text").getall()
+            visible_text = " ".join([t.strip() for t in visible_text_elements if t.strip() and len(t.strip()) < 500])
+            
+            # More specific selectors for LinkedIn's current structure
+            # Industry
+            industry_selectors = [
+                ".org-top-card-summary-info-list__item:contains('Industry')::text",
+                ".core-section-container__content:contains('Industry')::text",
+            ]
+            for selector in industry_selectors:
+                try:
+                    items = response.css(selector).getall()
+                    for item in items:
+                        if 'industry' in item.lower() and len(item.strip()) < 200:
+                            industry = re.sub(r'Industry[:\s]*', '', item, flags=re.IGNORECASE).strip()
+                            if industry and industry != "not-found":
+                                break
+                    if industry != "not-found":
+                        break
+                except:
+                    pass
+            
+            # If not found, try regex on visible text (filtered)
+            if industry == "not-found" and visible_text:
+                industry_match = re.search(r'Industry[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                if industry_match:
+                    industry = industry_match.group(1).strip()
+                    # Filter out JSON-like content
+                    if '$recipeTypes' in industry or 'entityUrn' in industry:
+                        industry = "not-found"
+            
+            # Company Size
+            size_selectors = [
+                ".org-top-card-summary-info-list__item:contains('employees')::text",
+                ".org-top-card-summary-info-list__item:contains('Company size')::text",
+            ]
+            for selector in size_selectors:
+                try:
+                    items = response.css(selector).getall()
+                    for item in items:
+                        if ('employee' in item.lower() or 'company size' in item.lower()) and len(item.strip()) < 200:
+                            size_match = re.search(r'(\d+[KMB]?|\d+,\d+)', item, re.IGNORECASE)
+                            if size_match:
+                                company_size = size_match.group(0)
+                                break
+                    if company_size != "not-found":
+                        break
+                except:
+                    pass
+            
+            # Headquarters
+            hq_selectors = [
+                ".org-top-card-summary-info-list__item:contains('Headquarters')::text",
+                ".core-section-container__content:contains('Headquarters')::text",
+            ]
+            for selector in hq_selectors:
+                try:
+                    items = response.css(selector).getall()
+                    for item in items:
+                        if 'headquarters' in item.lower() and len(item.strip()) < 200:
+                            headquarters = re.sub(r'Headquarters[:\s]*', '', item, flags=re.IGNORECASE).strip()
+                            if headquarters and headquarters != "not-found":
+                                break
+                    if headquarters != "not-found":
+                        break
+                except:
+                    pass
+            
+            if headquarters == "not-found" and visible_text:
+                hq_match = re.search(r'Headquarters[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                if hq_match:
+                    headquarters = hq_match.group(1).strip()
+                    if '$recipeTypes' in headquarters or 'entityUrn' in headquarters:
+                        headquarters = "not-found"
+            
+            # Type
+            if visible_text:
+                type_match = re.search(r'Type[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                if type_match:
+                    company_type = type_match.group(1).strip()
+                    if '$recipeTypes' in company_type or 'entityUrn' in company_type:
+                        company_type = "not-found"
+            
+            # Founded
+            if visible_text:
+                founded_match = re.search(r'Founded[:\s]+([^\n<]{1,100})', visible_text, re.IGNORECASE)
+                if founded_match:
+                    founded = founded_match.group(1).strip()
+                    if '$recipeTypes' in founded or 'entityUrn' in founded:
+                        founded = "not-found"
+            
+            # Specialties
+            if visible_text:
+                specialties_match = re.search(r'Specialties[:\s]+([^\n<]{1,200})', visible_text, re.IGNORECASE)
+                if specialties_match:
+                    specialties = specialties_match.group(1).strip()
+                    if '$recipeTypes' in specialties or 'entityUrn' in specialties:
+                        specialties = "not-found"
+            
+            company_item["industry"] = industry
+            company_item["company_size_approx"] = company_size
+            company_item["headquarters"] = headquarters
+            company_item["type"] = company_type
+            company_item["founded"] = founded
+            company_item["specialties"] = specialties
 
             # Funding fields (best-effort)
-            company_item["funding"] = response.css("p.text-display-lg::text").get(default="not-found").strip()
+            funding_text = response.css("p.text-display-lg::text").get()
+            company_item["funding"] = funding_text.strip() if funding_text else "not-found"
 
             rounds_text = response.xpath(
                 '//section[contains(@class, "aside-section-container")]/div/a[contains(@class, "link-styled")]//span[contains(@class, "before:middot")]/text()'
@@ -270,7 +512,8 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 '//section[contains(@class, "aside-section-container")]/div//div[contains(@class, "my-2")]/a[contains(@class, "link-styled")]//time[contains(@class, "before:middot")]/text()'
             ).get(default="not-found").strip()
 
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Error parsing company details for {response.url}: {e}")
             # Keep partial item if the page layout differs.
             company_item.setdefault("website", "not-found")
             company_item.setdefault("industry", "not-found")
