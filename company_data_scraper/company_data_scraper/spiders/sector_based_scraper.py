@@ -372,28 +372,28 @@ class SectorBasedScraperSpider(scrapy.Spider):
             else:
                 self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search: {search_url}")
             
-            cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
+        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
-            # Try direct LinkedIn first (better for JavaScript-rendered content)
-            yield scrapy.Request(
-                url=search_url,
-                callback=self.parse_search_results,
-                errback=self.errback_handler,
-                meta={
-                    "page": 1,
-                    "search_url": search_url,
-                    "cache_url": cache_url,
-                    "use_cache": False
-                },
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-                dont_filter=True
-            )
+        # Try direct LinkedIn first (better for JavaScript-rendered content)
+        yield scrapy.Request(
+            url=search_url,
+            callback=self.parse_search_results,
+            errback=self.errback_handler,
+            meta={
+                "page": 1,
+                "search_url": search_url,
+                "cache_url": cache_url,
+                "use_cache": False
+            },
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            dont_filter=True
+        )
 
     def errback_handler(self, failure):
         # Fallback to Google Cache if direct LinkedIn fails
@@ -739,18 +739,37 @@ class SectorBasedScraperSpider(scrapy.Spider):
                             continue
                         
                         # Filter out false positives:
-                        # - Version numbers like "10.001"
-                        if re.match(r'^\d{1,2}\.\d{1,3}$', phone_candidate):
+                        # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
+                        #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
+                        if re.match(r'^\d{1,2}\.\d{1,5}$', phone_candidate):
+                            self.logger.debug(f"Skipping version number: {phone_candidate}")
+                            continue
+                        # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
+                        #   Check if it starts with a version number pattern
+                        phone_parts = phone_candidate.split()
+                        if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
+                            self.logger.debug(f"Skipping version number with text: {phone_candidate}")
                             continue
                         # - IP addresses
                         if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_candidate):
+                            self.logger.debug(f"Skipping IP address: {phone_candidate}")
                             continue
                         # - Just 4 digits (years)
                         if re.match(r'^\d{4}$', phone_candidate):
+                            self.logger.debug(f"Skipping year: {phone_candidate}")
                             continue
                         # - Employee count ranges like "201-500", "1-10", "11-50", "51-200"
                         if re.match(r'^\d{1,4}-\d{1,4}$', phone_candidate):
                             self.logger.debug(f"Skipping employee count range: {phone_candidate}")
+                            continue
+                        # - Email-like patterns (contains @ or looks like email)
+                        if '@' in phone_candidate or re.search(r'[a-zA-Z]', phone_candidate):
+                            self.logger.debug(f"Skipping email-like pattern: {phone_candidate}")
+                            continue
+                        # - Check if phone has multiple parts separated by spaces (might be version + text)
+                        #   If it has more than 3 parts, it's likely not a phone number
+                        if len(phone_parts) > 3:
+                            self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_candidate}")
                             continue
                         
                         # If we get here, it's a valid phone number
@@ -780,17 +799,37 @@ class SectorBasedScraperSpider(scrapy.Spider):
                         # Skip if too short or too long
                         if len(digits_only) >= 10 and len(digits_only) <= 15:
                             # Filter out false positives:
-                            # - Version numbers like "10.001"
-                            if re.match(r'^\d{1,2}\.\d{1,3}$', phone_clean):
+                            # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
+                            #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
+                            if re.match(r'^\d{1,2}\.\d{1,5}$', phone_clean):
+                                self.logger.debug(f"Skipping version number: {phone_clean}")
+                                continue
+                            # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
+                            #   Check if it starts with a version number pattern
+                            phone_parts = phone_clean.split()
+                            if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
+                                self.logger.debug(f"Skipping version number with text: {phone_clean}")
                                 continue
                             # - IP addresses
                             if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
+                                self.logger.debug(f"Skipping IP address: {phone_clean}")
                                 continue
                             # - Just 4 digits (years)
                             if re.match(r'^\d{4}$', phone_clean):
+                                self.logger.debug(f"Skipping year: {phone_clean}")
                                 continue
                             # - Employee count ranges like "201-500", "1-10", "11-50"
                             if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
+                                self.logger.debug(f"Skipping employee count range: {phone_clean}")
+                                continue
+                            # - Email-like patterns (contains @ or looks like email)
+                            if '@' in phone_clean or re.search(r'[a-zA-Z]', phone_clean):
+                                self.logger.debug(f"Skipping email-like pattern: {phone_clean}")
+                                continue
+                            # - Check if phone has multiple parts separated by spaces (might be version + text)
+                            #   If it has more than 3 parts, it's likely not a phone number
+                            if len(phone_parts) > 3:
+                                self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_clean}")
                                 continue
                             # - Should look like a phone number (has +, 0, or proper format)
                             if (phone_clean.startswith('+') or 
@@ -855,7 +894,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 self.logger.debug(f"Error searching for email in visible text: {e}")
 
         # Company Details Block - Modern LinkedIn structure
-        website = None
+            website = None
         visible_text = ""  # Initialize for use in sector filtering
         try:
             # Website - More specific selectors including About page structure
@@ -992,7 +1031,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     specialties = specialties_match.group(1).strip()
                     if '$recipeTypes' in specialties or 'entityUrn' in specialties:
                         specialties = "not-found"
-
+            
         except Exception as e:
             self.logger.warning(f"Error parsing company details for {response.url}: {e}")
         
@@ -1227,17 +1266,37 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     digits_only = re.sub(r'[^\d]', '', phone_clean)
                     if len(digits_only) >= 10 and len(digits_only) <= 15:
                         # Filter out false positives:
-                        # - Version numbers like "10.001"
-                        if re.match(r'^\d{1,2}\.\d{1,3}$', phone_clean):
+                        # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
+                        #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
+                        if re.match(r'^\d{1,2}\.\d{1,5}$', phone_clean):
+                            self.logger.debug(f"Skipping version number: {phone_clean}")
+                            continue
+                        # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
+                        #   Check if it starts with a version number pattern
+                        phone_parts = phone_clean.split()
+                        if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
+                            self.logger.debug(f"Skipping version number with text: {phone_clean}")
                             continue
                         # - IP addresses
                         if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
+                            self.logger.debug(f"Skipping IP address: {phone_clean}")
                             continue
                         # - Just 4 digits (years)
                         if re.match(r'^\d{4}$', phone_clean):
+                            self.logger.debug(f"Skipping year: {phone_clean}")
                             continue
                         # - Employee count ranges like "201-500", "1-10"
                         if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
+                            self.logger.debug(f"Skipping employee count range: {phone_clean}")
+                            continue
+                        # - Email-like patterns (contains @ or looks like email)
+                        if '@' in phone_clean or re.search(r'[a-zA-Z]', phone_clean):
+                            self.logger.debug(f"Skipping email-like pattern: {phone_clean}")
+                            continue
+                        # - Check if phone has multiple parts separated by spaces (might be version + text)
+                        #   If it has more than 3 parts, it's likely not a phone number
+                        if len(phone_parts) > 3:
+                            self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_clean}")
                             continue
                         # Additional validation: should contain country code or area code pattern
                         # Turkish: starts with 0 or +90, or has area code pattern
