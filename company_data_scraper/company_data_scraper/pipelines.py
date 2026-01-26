@@ -45,8 +45,42 @@ class MongoPipeline:
         self.collection = self.db[self.mongo_collection]
         
         # Create indexes for better performance
-        self.collection.create_index([("website", 1)], unique=True, sparse=True)
-        self.collection.create_index([("company_name", 1), ("location", 1)])
+        # Remove sparse unique index on website (causes issues with multiple null values)
+        # Use compound unique index on company_name + location instead
+        
+        # Get existing indexes
+        existing_indexes = self.collection.list_indexes()
+        index_names = [idx['name'] for idx in existing_indexes]
+        
+        # Drop old sparse unique index on website if exists
+        if "website_1" in index_names:
+            try:
+                self.collection.drop_index("website_1")
+                spider.logger.info("Dropped old website_1 index")
+            except Exception as e:
+                spider.logger.warning(f"Could not drop website_1 index: {e}")
+        
+        # Drop existing compound index if it exists (might not be unique)
+        if "company_name_1_location_1" in index_names:
+            try:
+                self.collection.drop_index("company_name_1_location_1")
+                spider.logger.info("Dropped old company_name_1_location_1 index")
+            except Exception as e:
+                spider.logger.warning(f"Could not drop company_name_1_location_1 index: {e}")
+        
+        # Create compound unique index for company_name + location
+        try:
+            self.collection.create_index([("company_name", 1), ("location", 1)], unique=True)
+            spider.logger.info("Created unique index on company_name + location")
+        except Exception as e:
+            spider.logger.warning(f"Could not create unique index: {e}")
+        
+        # Non-unique index on website for faster queries (when website exists)
+        try:
+            self.collection.create_index([("website", 1)], sparse=True)
+            spider.logger.info("Created sparse index on website")
+        except Exception as e:
+            spider.logger.warning(f"Could not create website index: {e}")
         
         spider.logger.info(f"Connected to MongoDB: {self.mongo_db}.{self.mongo_collection}")
     

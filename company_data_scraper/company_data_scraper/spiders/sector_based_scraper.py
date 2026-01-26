@@ -23,18 +23,11 @@ class SectorBasedScraperSpider(scrapy.Spider):
         r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}'
     )
     
-    # Common contact/about page paths to check
+    # Common contact/about page paths to check (optimized: only most common paths)
     CONTACT_PATHS = [
-        '/',
-        '/contact',
-        '/iletisim',
-        '/about',
-        '/hakkimizda',
-        '/support',
-        '/contacts',
-        '/iletisim-bilgileri',
-        '/contact-us',
-        '/bize-ulasin',
+        '/',  # Homepage
+        '/contact',  # English contact
+        '/iletisim',  # Turkish contact
     ]
     
     # Sector/Industry mapping for Turkish-English matching
@@ -49,6 +42,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
         'retail': ['retail', 'perakende', 'retail trade'],
         'education': ['education', 'eğitim', 'educational services'],
     }
+    
+    # LinkedIn Sector ID mapping (f_I parameter values)
+    # These are LinkedIn's internal industry/vertical IDs
+    LINKEDIN_SECTOR_IDS = {
+        'technology': ['96', '1594', '6'],  # BT Hizmetleri ve BT Danışmanlığı, Teknoloji Bilgi ve Medya, Teknoloji Bilgi ve İnternet
+        'bt': ['96'],  # BT Hizmetleri ve BT Danışmanlığı
+        'finance': ['43'],  # Finansal Hizmetler (approximate)
+        'healthcare': ['6'],  # Sağlık (approximate)
+        'manufacturing': ['25'],  # Üretim
+        'retail': ['47'],  # Perakende (approximate)
+        'education': ['5'],  # Eğitim (approximate)
+    }
 
     def __init__(self, sector: str = "", location: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -61,7 +66,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
         try:
             self.max_pages = max(1, int(max_pages))
         except Exception:
-            self.max_pages = 3
+            self.max_pages = 20  # Increased default from 3 to 20 for more comprehensive results
             
         try:
             self.limit = max(1, int(limit))
@@ -72,63 +77,137 @@ class SectorBasedScraperSpider(scrapy.Spider):
         self.processed_count = 0
         # Track companies being scraped (website -> company data)
         self.companies_in_progress = {}
+        # Track consecutive pages with no new URLs
+        self.consecutive_duplicate_pages = 0
 
     def start_requests(self):
-        # Try direct LinkedIn access first, fallback to Google Cache if needed
-        encoded_sector = quote_plus(self.sector)
-        search_url = f"https://www.linkedin.com/search/results/companies/?keywords={encoded_sector}"
+        # Try LinkedIn's sector filtering system first (more accurate results)
+        # LinkedIn uses f_I parameter for industry/vertical filtering
+        sector_key = self.sector.lower().strip()
         
-        # Add location to search URL if provided
-        if self.location:
-            encoded_location = quote_plus(self.location)
-            search_url += f"&geoId=&location={encoded_location}"
-        
-        self.logger.info(f"🔍 Starting search: {search_url}")
-        
-        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
+        # Check if we have LinkedIn sector ID for this sector
+        if sector_key in self.LINKEDIN_SECTOR_IDS:
+            sector_ids = self.LINKEDIN_SECTOR_IDS[sector_key]
+            self.logger.info(f"✅ Found {len(sector_ids)} sector ID(s) for '{sector_key}': {sector_ids}")
+            
+            # Use ALL sector IDs to get maximum coverage
+            # Each ID represents a different subcategory (e.g., BT Hizmetleri, Teknoloji Bilgi ve Medya, etc.)
+            for idx, sector_id in enumerate(sector_ids, 1):
+                search_url = f"https://www.linkedin.com/search/results/companies/?f_I={sector_id}"
+                
+                # Add location to search URL if provided
+                if self.location:
+                    encoded_location = quote_plus(self.location)
+                    search_url += f"&geoId=&location={encoded_location}"
+                    self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} + location '{self.location}': {search_url}")
+                else:
+                    self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} (no location filter): {search_url}")
+                
+                cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
-        # Try direct LinkedIn first (better for JavaScript-rendered content)
-        yield scrapy.Request(
-            url=search_url,
-            callback=self.parse_search_results,
-            errback=self.errback_handler,
-            meta={
-                "page": 1,
-                "search_url": search_url,
-                "cache_url": cache_url,
-                "use_cache": False
-            },
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            dont_filter=True
-        )
+                # Try direct LinkedIn first (better for JavaScript-rendered content)
+                yield scrapy.Request(
+                    url=search_url,
+                    callback=self.parse_search_results,
+                    errback=self.errback_handler,
+                    meta={
+                        "page": 1,
+                        "search_url": search_url,
+                        "sector_id": sector_id,
+                        "sector_id_index": idx,
+                        "total_sector_ids": len(sector_ids),
+                        "cache_url": cache_url,
+                        "use_cache": False
+                    },
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
+                    dont_filter=True
+                )
+        else:
+            # Fallback: Use keywords search (less accurate but works for any sector)
+            encoded_sector = quote_plus(self.sector)
+            search_url = f"https://www.linkedin.com/search/results/companies/?keywords={encoded_sector}"
+            
+            # Add location to search URL if provided
+            if self.location:
+                encoded_location = quote_plus(self.location)
+                search_url += f"&geoId=&location={encoded_location}"
+            
+            self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search: {search_url}")
+            
+            cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
+
+            # Try direct LinkedIn first (better for JavaScript-rendered content)
+            yield scrapy.Request(
+                url=search_url,
+                callback=self.parse_search_results,
+                errback=self.errback_handler,
+                meta={
+                    "page": 1,
+                    "search_url": search_url,
+                    "cache_url": cache_url,
+                    "use_cache": False
+                },
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+                dont_filter=True
+            )
 
     def errback_handler(self, failure):
         # Fallback to Google Cache if direct LinkedIn fails
-        self.logger.warning(f"Direct LinkedIn request failed: {failure.value}. Trying Google Cache...")
         request = failure.request
+        page = request.meta.get("page", 1)
+        is_pagination = page > 1
+        
+        if is_pagination:
+            self.logger.error(f"❌ Pagination request failed for page {page}: {failure.value}")
+            self.logger.error(f"❌ Failed URL: {request.url}")
+        else:
+            self.logger.warning(f"⚠️  Initial search request failed: {failure.value}. Trying Google Cache...")
+        
         cache_url = request.meta.get("cache_url")
         if cache_url:
+            if is_pagination:
+                self.logger.info(f"🔄 Retrying pagination page {page} with Google Cache...")
             yield scrapy.Request(
                 url=cache_url,
                 callback=self.parse_search_results,
                 meta={
-                    "page": request.meta.get("page", 1),
+                    "page": page,
                     "search_url": request.meta.get("search_url"),
+                    "sector_id": request.meta.get("sector_id", "N/A"),
+                    "sector_id_index": request.meta.get("sector_id_index", ""),
+                    "total_sector_ids": request.meta.get("total_sector_ids", ""),
                     "cache_url": cache_url,
                     "use_cache": True
                 },
                 dont_filter=True
             )
+        else:
+            self.logger.error(f"❌ No cache URL available for failed request: {request.url}")
 
     def parse_search_results(self, response):
         page = int(response.meta.get("page", 1))
         search_url = response.meta.get("search_url")
+        sector_id = response.meta.get("sector_id", "N/A")
+        sector_id_index = response.meta.get("sector_id_index", "")
+        total_sector_ids = response.meta.get("total_sector_ids", "")
+        
+        # Log which sector ID search this is
+        if sector_id_index and total_sector_ids:
+            self.logger.info(f"📊 Processing page {page} from sector ID {sector_id} ({sector_id_index}/{total_sector_ids}) - Processed: {self.processed_count}/{self.limit}")
+        else:
+            self.logger.info(f"📊 Processing page {page} - Processed: {self.processed_count}/{self.limit}")
 
         # Multiple strategies to extract company URLs from LinkedIn search results
         # Strategy 1: Try LinkedIn-specific CSS selectors for search results
@@ -164,13 +243,25 @@ class SectorBasedScraperSpider(scrapy.Spider):
         # Extract and normalize URLs
         normalized_urls = self._extract_company_urls(company_urls)
         
-        self.logger.info(f"Page {page}: Found {len(normalized_urls)} unique company URLs")
+        self.logger.info(f"📄 Page {page}: Found {len(normalized_urls)} company URLs (raw: {len(company_urls)})")
         
         # If no URLs found, log the response for debugging
         if not normalized_urls:
-            self.logger.warning(f"No company URLs found on page {page}. Response status: {response.status}")
-            self.logger.debug(f"Response URL: {response.url}")
-            self.logger.debug(f"Response body preview (first 500 chars): {response.text[:500]}")
+            self.logger.warning(f"⚠️  No company URLs found on page {page}. Response status: {response.status}")
+            self.logger.warning(f"⚠️  Response URL: {response.url}")
+            self.logger.debug(f"Response body preview (first 1000 chars): {response.text[:1000]}")
+            # Still try pagination if this is the first page (might be a temporary issue)
+            if page == 1:
+                self.logger.warning(f"⚠️  No URLs on first page, but will try pagination anyway")
+
+        # Count new (non-duplicate) URLs BEFORE adding them to _seen_company_urls
+        new_urls_count = 0
+        for company_url in normalized_urls:
+            base_url = company_url.rstrip('/').replace('/about', '')
+            if base_url not in self._seen_company_urls:
+                new_urls_count += 1
+
+        self.logger.info(f"Page {page}: {new_urls_count} new URLs, {len(normalized_urls) - new_urls_count} duplicates")
 
         for company_url in normalized_urls:
             # Check limit before processing more companies
@@ -200,58 +291,115 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 errback=self.handle_company_profile_error,
             )
 
-        # Try pagination: LinkedIn typically supports `page=` in the query for some UIs.
-        # Only paginate if we haven't reached the limit and found results
-        # Count how many new (non-duplicate) URLs were found
-        new_urls_count = sum(1 for url in normalized_urls 
-                            if url.rstrip('/').replace('/about', '') not in self._seen_company_urls)
+        # Try pagination: LinkedIn typically supports `start=` parameter for pagination
+        # AGGRESSIVE PAGINATION: Continue until we reach the limit or truly run out of results
         
-        if page <= self.max_pages and self.processed_count < self.limit:
-            # Continue pagination if:
-            # 1. We found new URLs on this page, OR
-            # 2. This is the first page (might have duplicates from previous runs)
-            if new_urls_count > 0 or page == 1:
-                next_page = page + 1
-                use_cache = response.meta.get("use_cache", False)
-                
-                if use_cache:
-                    # Use Google Cache for pagination
-                    next_search_url = f"{search_url}&page={next_page}"
-                    next_cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{next_search_url}"
-                    next_url = next_cache_url
-                else:
-                    # Use direct LinkedIn URL for pagination
-                    # LinkedIn uses start parameter for pagination: start=0, start=10, start=20, etc.
-                    start_param = (next_page - 1) * 10
-                    # LinkedIn typically shows 10 results per page
-                    if '?' in search_url:
-                        next_search_url = f"{search_url}&start={start_param}"
-                    else:
-                        next_search_url = f"{search_url}?start={start_param}"
-                    next_url = next_search_url
-                    self.logger.info(f"📄 Requesting page {next_page} (start={start_param}, found {new_urls_count} new URLs)")
-                
-                yield scrapy.Request(
-                    url=next_url,
-                    callback=self.parse_search_results,
-                    errback=self.errback_handler,
-                    meta={
-                        "page": next_page,
-                        "search_url": search_url,
-                        "cache_url": f"https://webcache.googleusercontent.com/search?q=cache:{search_url}&page={next_page}",
-                        "use_cache": use_cache
-                    },
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5", 
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Connection": "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                    } if not use_cache else {},
-                    dont_filter=True
-                )
+        # Track consecutive duplicate pages
+        if new_urls_count == 0:
+            self.consecutive_duplicate_pages += 1
+        else:
+            self.consecutive_duplicate_pages = 0  # Reset counter if we found new URLs
+        
+        # Calculate effective max pages based on limit (each page has ~10 results)
+        # If limit is 50, we need at least 5 pages, but add large buffer for duplicates
+        effective_max_pages = max(self.max_pages, (self.limit // 10) + 30)
+        
+        # Stop if we've had too many consecutive duplicate pages (likely reached end of results)
+        # Increased to allow more pages to be checked
+        max_consecutive_duplicates = 10  # Increased from 5 to 10
+        
+        # AGGRESSIVE PAGINATION: Always continue if we haven't reached limit
+        # Only stop if we've hit too many consecutive duplicates OR reached max pages
+        should_paginate = (
+            self.processed_count < self.limit and 
+            self.consecutive_duplicate_pages < max_consecutive_duplicates and
+            page < effective_max_pages
+        )
+        
+        # Detailed pagination decision logging
+        self.logger.info(f"🔍 Pagination check: processed={self.processed_count}/{self.limit}, consecutive_duplicates={self.consecutive_duplicate_pages}/{max_consecutive_duplicates}, page={page}/{effective_max_pages}")
+        self.logger.info(f"🔍 should_paginate={should_paginate}")
+        
+        if not should_paginate:
+            reasons = []
+            if self.processed_count >= self.limit:
+                reasons.append(f"reached_limit({self.processed_count}>={self.limit})")
+            if self.consecutive_duplicate_pages >= max_consecutive_duplicates:
+                reasons.append(f"too_many_duplicates({self.consecutive_duplicate_pages}>={max_consecutive_duplicates})")
+            if page >= effective_max_pages:
+                reasons.append(f"max_pages_reached({page}>={effective_max_pages})")
+            self.logger.warning(f"⏹️  Stopping pagination: {', '.join(reasons) if reasons else 'unknown reason'}")
+        
+        if should_paginate:
+            next_page = page + 1
+            use_cache = response.meta.get("use_cache", False)
+            
+            # Get original search_url without start parameter (from meta)
+            # This ensures we always use the base URL for pagination
+            original_search_url = search_url
+            # Remove any existing start parameter from the URL
+            if '&start=' in original_search_url or '?start=' in original_search_url:
+                original_search_url = re.sub(r'[&?]start=\d+', '', original_search_url)
+            
+            # Log pagination decision
+            self.logger.info(f"📊 Page {page} summary: {len(normalized_urls)} URLs found, {new_urls_count} new, {self.processed_count}/{self.limit} processed, {self.consecutive_duplicate_pages} consecutive duplicates")
+            
+            if use_cache:
+                # Use Google Cache for pagination
+                next_search_url = f"{original_search_url}&page={next_page}"
+                next_cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{next_search_url}"
+                next_url = next_cache_url
             else:
-                self.logger.info(f"⏹️  Stopping pagination: No new URLs found on page {page} (all duplicates)")
+                # Use direct LinkedIn URL for pagination
+                # LinkedIn uses start parameter for pagination: start=0, start=10, start=20, etc.
+                start_param = (next_page - 1) * 10
+                
+                # Handle both f_I (sector ID) and keywords search formats
+                if '?' in original_search_url:
+                    next_search_url = f"{original_search_url}&start={start_param}"
+                else:
+                    next_search_url = f"{original_search_url}?start={start_param}"
+                
+                next_url = next_search_url
+                sector_info = f" (sector ID: {sector_id})" if sector_id != "N/A" else ""
+                self.logger.info(f"📄 Requesting page {next_page}{sector_info} (start={start_param}, found {new_urls_count} new URLs, processed {self.processed_count}/{self.limit}, total URLs on page: {len(normalized_urls)})")
+                self.logger.info(f"📄 Next URL: {next_url}")
+            
+            # Create and yield pagination request
+            pagination_request = scrapy.Request(
+                url=next_url,
+                callback=self.parse_search_results,
+                errback=self.errback_handler,
+                meta={
+                    "page": next_page,
+                    "search_url": original_search_url,  # Store original URL without start param
+                    "sector_id": sector_id,
+                    "sector_id_index": sector_id_index,
+                    "total_sector_ids": total_sector_ids,
+                    "cache_url": f"https://webcache.googleusercontent.com/search?q=cache:{original_search_url}&page={next_page}",
+                    "use_cache": use_cache
+                },
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5", 
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                } if not use_cache else {},
+                dont_filter=True
+            )
+            self.logger.info(f"✅ Yielding pagination request for page {next_page}: {next_url}")
+            yield pagination_request
+        else:
+            # Log why we're stopping
+            if self.processed_count >= self.limit:
+                self.logger.info(f"✅ Stopping pagination: Reached limit of {self.limit} companies")
+            elif self.consecutive_duplicate_pages >= max_consecutive_duplicates:
+                self.logger.info(f"⏹️  Stopping pagination: {self.consecutive_duplicate_pages} consecutive pages with no new URLs (likely reached end of results)")
+            elif page >= effective_max_pages:
+                self.logger.info(f"⏹️  Stopping pagination: Reached max pages limit ({effective_max_pages})")
+            else:
+                self.logger.info(f"⏹️  Stopping pagination: Unknown reason")
 
     def parse_company_profile(self, response):
         self.logger.info(f"Parsing company profile: {response.url}")
@@ -726,7 +874,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
         company_data = self.companies_in_progress[company_key]
         company_data['pages_processed'] += 1
         
-        self.logger.warning(f"Failed to scrape {failure.request.url}: {failure.value}")
+        # Check error type - skip logging for common non-critical errors
+        error_value = str(failure.value) if failure.value else ""
+        status_code = None
+        if hasattr(failure.value, 'response') and failure.value.response:
+            status_code = failure.value.response.status
+        
+        # Only log warnings for non-404/403 errors (404/403 are expected for many sites)
+        if status_code not in [404, 403]:
+            self.logger.warning(f"Failed to scrape {failure.request.url}: {error_value[:100]}")
+        else:
+            # Silently skip 404/403 errors (common for contact pages)
+            self.logger.debug(f"Skipping {failure.request.url}: {status_code}")
         
         # Check if all pages have been processed (including errors)
         if company_data['pages_processed'] >= company_data['total_pages']:

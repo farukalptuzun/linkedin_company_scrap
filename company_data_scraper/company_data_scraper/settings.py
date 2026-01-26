@@ -21,6 +21,9 @@ RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
 RETRY_TIMES = 3
 RETRY_PRIORITY_ADJUST = -1
 
+# Timeout settings - reduced for faster website scraping
+DOWNLOAD_TIMEOUT = 30  # Reduced from default 180s to 30s
+
 # MongoDB settings (can be overridden by environment variables)
 import os
 from dotenv import load_dotenv

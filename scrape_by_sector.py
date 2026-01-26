@@ -17,7 +17,7 @@ def main() -> int:
     parser.add_argument("-s", "--sector", required=True, help='Sector keyword, e.g. "Technology"')
     parser.add_argument("-l", "--location", required=True, help='Location, e.g. "Istanbul"')
     parser.add_argument("--limit", type=int, default=20, help="Maximum number of companies to scrape (default: 20)")
-    parser.add_argument("--max-pages", default="3", help="Max search pages to crawl (default: 3)")
+    parser.add_argument("--max-pages", default="20", help="Max search pages to crawl per sector ID (default: 20)")
     args = parser.parse_args()
 
     root_dir = os.path.dirname(os.path.abspath(__file__))
