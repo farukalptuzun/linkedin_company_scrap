@@ -18,9 +18,14 @@ class SectorBasedScraperSpider(scrapy.Spider):
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     )
     
-    # Phone regex pattern (matches various phone formats)
+    # Phone regex pattern (matches various phone formats including Turkish formats)
     PHONE_PATTERN = re.compile(
-        r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}'
+        r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}'  # International formats
+        r'|(?:\+90|0)?\s*\(?\d{3}\)?\s*\d{3}\s*\d{2}\s*\d{2}'  # Turkish format: 0212 123 45 67
+        r'|\+90\s*\d{3}\s*\d{3}\s*\d{2}\s*\d{2}'  # +90 212 123 45 67
+        r'|0\d{3}\s*\d{3}\s*\d{2}\s*\d{2}'  # 02121234567
+        r'|\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'  # US/International: +1 (212) 123-4567
+        r'|\+?\d{1,3}[-.\s]?\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{2,4}'  # Flexible international
     )
     
     # Common contact/about page paths to check (optimized: only most common paths)
@@ -28,6 +33,11 @@ class SectorBasedScraperSpider(scrapy.Spider):
         '/',  # Homepage
         '/contact',  # English contact
         '/iletisim',  # Turkish contact
+        '/contact-us',  # Contact us
+        '/iletisim-bilgileri',  # Turkish contact info
+        '/hakkimizda',  # Turkish about
+        '/about',  # About
+        '/about-us',  # About us
     ]
     
     # Sector/Industry mapping for Turkish-English matching
@@ -54,12 +64,215 @@ class SectorBasedScraperSpider(scrapy.Spider):
         'retail': ['47'],  # Perakende (approximate)
         'education': ['5'],  # Eğitim (approximate)
     }
+    
+    # LinkedIn GeoId mapping (companyHqGeo parameter values)
+    # Şehir adından LinkedIn GeoId'ye çevirmek için kullanılır
+    LINKEDIN_GEO_IDS = {
+        # Türkiye Şehirleri
+        'istanbul': '102424322',
+        'i̇stanbul': '102424322',  # Türkçe karakter
+        'ankara': '102424323',
+        'izmir': '102424324',
+        'bursa': '102424325',
+        'antalya': '102424326',
+        'adana': '102424327',
+        'gaziantep': '102424328',
+        'konya': '102424329',
+        'kayseri': '102424330',
+        'eskisehir': '102424331',
+        'eskisehir': '102424331',
+        'eskişehir': '102424331',  # Türkçe karakter
+        'mersin': '102424332',
+        'diyarbakir': '102424333',
+        'diyarbakır': '102424333',  # Türkçe karakter
+        'samsun': '102424334',
+        'denizli': '102424335',
+        'sanliurfa': '102424336',
+        'şanlıurfa': '102424336',  # Türkçe karakter
+        'adapazari': '102424337',
+        'adapazarı': '102424337',  # Türkçe karakter
+        'malatya': '102424338',
+        'erzurum': '102424339',
+        'van': '102424340',
+        'batman': '102424341',
+        'elazig': '102424342',
+        'elazığ': '102424342',  # Türkçe karakter
+        'izmit': '102424343',
+        'manisa': '102424344',
+        'sivas': '102424345',
+        'gebze': '102424346',
+        'balikesir': '102424347',
+        'balıkesir': '102424347',  # Türkçe karakter
+        'tarsus': '102424348',
+        'kutahya': '102424349',
+        'kütahya': '102424349',  # Türkçe karakter
+        'trabzon': '102424350',
+        'corum': '102424351',
+        'çorum': '102424351',  # Türkçe karakter
+        'kocaeli': '102424352',
+        'osmaniye': '102424353',
+        'cayirova': '102424354',
+        'çayırova': '102424354',  # Türkçe karakter
+        'mugla': '102424355',
+        'muğla': '102424355',  # Türkçe karakter
+        'antalya': '102424326',
+        'antalya': '102424326',
+        
+        # Yurtdışı Popüler Şehirler
+        'london': '90009449',
+        'paris': '105015875',
+        'berlin': '106967730',
+        'amsterdam': '100565486',
+        'munich': '106967730',
+        'münchen': '106967730',
+        'frankfurt': '106967730',
+        'hamburg': '106967730',
+        'rome': '105015875',
+        'roma': '105015875',
+        'madrid': '105015875',
+        'barcelona': '105015875',
+        'milan': '105015875',
+        'milano': '105015875',
+        'vienna': '105015875',
+        'wien': '105015875',
+        'zurich': '105015875',
+        'zürich': '105015875',
+        'brussels': '105015875',
+        'brussel': '105015875',
+        'stockholm': '105117694',
+        'copenhagen': '105117694',
+        'kobenhavn': '105117694',
+        'oslo': '105117694',
+        'helsinki': '105117694',
+        'warsaw': '105117694',
+        'warszawa': '105117694',
+        'prague': '105015875',
+        'praha': '105015875',
+        'budapest': '105015875',
+        'bucharest': '105015875',
+        'bucuresti': '105015875',
+        'athens': '105015875',
+        'athina': '105015875',
+        'lisbon': '105015875',
+        'lisboa': '105015875',
+        'dublin': '105015875',
+        'new york': '103644278',
+        'new york city': '103644278',
+        'nyc': '103644278',
+        'san francisco': '103748137',
+        'sf': '103748137',
+        'los angeles': '102748796',
+        'la': '102748796',
+        'chicago': '103644278',
+        'boston': '103644278',
+        'seattle': '103748137',
+        'washington': '103644278',
+        'washington dc': '103644278',
+        'dc': '103644278',
+        'miami': '103644278',
+        'atlanta': '103644278',
+        'houston': '103644278',
+        'dallas': '103644278',
+        'philadelphia': '103644278',
+        'phoenix': '103748137',
+        'toronto': '103323778',
+        'vancouver': '103323778',
+        'montreal': '103323778',
+        'tokyo': '103323778',
+        'osaka': '103323778',
+        'yokohama': '103323778',
+        'nagoya': '103323778',
+        'sydney': '105117694',
+        'melbourne': '105117694',
+        'brisbane': '105117694',
+        'perth': '105117694',
+        'singapore': '102454443',
+        'hong kong': '103323778',
+        'shanghai': '103323778',
+        'beijing': '103323778',
+        'seoul': '103323778',
+        'bangkok': '105117694',
+        'kuala lumpur': '102454443',
+        'jakarta': '102454443',
+        'manila': '102454443',
+        'mumbai': '103323778',
+        'bombay': '103323778',
+        'delhi': '103323778',
+        'new delhi': '103323778',
+        'bangalore': '103323778',
+        'bengaluru': '103323778',
+        'dubai': '102460086',
+        'abu dhabi': '102460086',
+        'riyadh': '102460086',
+        'jeddah': '102460086',
+        'tel aviv': '103323778',
+        'cairo': '103323778',
+        'johannesburg': '105117694',
+        'cape town': '105117694',
+        'sao paulo': '103323778',
+        'rio de janeiro': '103323778',
+        'mexico city': '103323778',
+        'buenos aires': '103323778',
+    }
+
+    @staticmethod
+    def get_geo_id_from_location(location: str) -> str:
+        """
+        Şehir adından LinkedIn GeoId'yi bulur.
+        
+        Args:
+            location: Şehir adı (örn: "Istanbul", "İstanbul", "istanbul", "Istanbul, Turkey")
+        
+        Returns:
+            GeoId string veya boş string
+        """
+        if not location:
+            return ""
+        
+        # Normalize: lowercase, strip
+        location_normalized = location.lower().strip()
+        
+        # Direkt mapping kontrolü
+        if location_normalized in SectorBasedScraperSpider.LINKEDIN_GEO_IDS:
+            return SectorBasedScraperSpider.LINKEDIN_GEO_IDS[location_normalized]
+        
+        # Türkçe karakterleri normalize et (ı -> i, ğ -> g, ü -> u, ş -> s, ö -> o, ç -> c)
+        turkish_chars = {'ı': 'i', 'ğ': 'g', 'ü': 'u', 'ş': 's', 'ö': 'o', 'ç': 'c', 'İ': 'i'}
+        location_normalized_no_turkish = location_normalized
+        for turkish, english in turkish_chars.items():
+            location_normalized_no_turkish = location_normalized_no_turkish.replace(turkish, english)
+        
+        if location_normalized_no_turkish in SectorBasedScraperSpider.LINKEDIN_GEO_IDS:
+            return SectorBasedScraperSpider.LINKEDIN_GEO_IDS[location_normalized_no_turkish]
+        
+        # Partial match (örn: "Istanbul, Turkey" -> "istanbul")
+        # Önce virgül veya boşluk ile ayrılmış ilk kelimeyi al
+        location_first_word = location_normalized.split(',')[0].split()[0] if location_normalized else ""
+        if location_first_word and location_first_word in SectorBasedScraperSpider.LINKEDIN_GEO_IDS:
+            return SectorBasedScraperSpider.LINKEDIN_GEO_IDS[location_first_word]
+        
+        # Tüm mapping'de partial match ara
+        for city, geo_id in SectorBasedScraperSpider.LINKEDIN_GEO_IDS.items():
+            if city in location_normalized or location_normalized in city:
+                return geo_id
+        
+        return ""
 
     def __init__(self, sector: str = "", location: str = "", geo_id: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sector = (sector or "").strip()
         self.location = (location or "").strip()
         self.geo_id = (geo_id or "").strip()
+        
+        # Eğer location verilmişse ama geo_id verilmemişse, otomatik bul
+        if self.location and not self.geo_id:
+            auto_geo_id = self.get_geo_id_from_location(self.location)
+            if auto_geo_id:
+                self.geo_id = auto_geo_id
+                self.logger.info(f"✅ Auto-detected geo_id '{auto_geo_id}' for location '{self.location}'")
+            else:
+                self.logger.warning(f"⚠️  Could not find geo_id for location '{self.location}'. Location filtering may not work.")
+                self.logger.info(f"   Available locations: {', '.join(list(self.LINKEDIN_GEO_IDS.keys())[:10])}...")
         
         if not self.sector:
             raise ValueError("sector is required. Example: scrapy crawl sector_based_scraper -a sector='Technology'")
@@ -495,18 +708,100 @@ class SectorBasedScraperSpider(scrapy.Spider):
             'dd a[href^="tel:"] span::text',
             '.org-top-card-summary-info-list__item:contains("phone")::text',
             '.org-top-card-summary-info-list__item:contains("Phone")::text',
+            '.org-top-card-summary-info-list__item:contains("Telefon")::text',  # Türkçe
+            '.org-top-card-summary-info-list__item:contains("telefon")::text',
+            'dt:contains("Phone") + dd::text',
+            'dt:contains("Telefon") + dd::text',
+            'dd:contains("+")::text',  # + işareti içeren dd elementleri
+            'dd:contains("0")::text',  # 0 ile başlayan telefonlar (Türk formatı)
+            '.core-section-container__content:contains("Phone")::text',
+            '.core-section-container__content:contains("Telefon")::text',
         ]
         for selector in phone_selectors:
-            phone_text = response.css(selector).get()
-            if phone_text:
-                # Remove tel: prefix if present
-                phone_text = phone_text.replace('tel:', '').strip()
-                # Extract phone from tel: link or text
-                phone_match = self.PHONE_PATTERN.search(phone_text)
-                if phone_match:
-                    phone_from_linkedin = phone_match.group(0)
-                    self.logger.info(f"✅ Found phone on LinkedIn: {phone_from_linkedin}")
-                break
+            try:
+                phone_text = response.css(selector).get()
+                if phone_text:
+                    # Remove tel: prefix if present
+                    phone_text = phone_text.replace('tel:', '').strip()
+                    # Extract phone from tel: link or text
+                    phone_match = self.PHONE_PATTERN.search(phone_text)
+                    if phone_match:
+                        phone_candidate = phone_match.group(0).strip()
+                        
+                        # Clean up phone number (remove extra spaces, normalize)
+                        phone_candidate = re.sub(r'\s+', ' ', phone_candidate)
+                        
+                        # Count digits only (not characters)
+                        digits_only = re.sub(r'[^\d]', '', phone_candidate)
+                        
+                        # Skip if too short or too long
+                        if len(digits_only) < 10 or len(digits_only) > 15:
+                            continue
+                        
+                        # Filter out false positives:
+                        # - Version numbers like "10.001"
+                        if re.match(r'^\d{1,2}\.\d{1,3}$', phone_candidate):
+                            continue
+                        # - IP addresses
+                        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_candidate):
+                            continue
+                        # - Just 4 digits (years)
+                        if re.match(r'^\d{4}$', phone_candidate):
+                            continue
+                        # - Employee count ranges like "201-500", "1-10", "11-50", "51-200"
+                        if re.match(r'^\d{1,4}-\d{1,4}$', phone_candidate):
+                            self.logger.debug(f"Skipping employee count range: {phone_candidate}")
+                            continue
+                        
+                        # If we get here, it's a valid phone number
+                        phone_from_linkedin = phone_candidate
+                        self.logger.info(f"✅ Found phone on LinkedIn: {phone_from_linkedin}")
+                        break
+            except Exception as e:
+                self.logger.debug(f"Error with phone selector {selector}: {e}")
+                continue
+        
+        # If not found in selectors, try searching in visible text
+        if not phone_from_linkedin:
+            try:
+                # Get visible text from the page
+                visible_text_elements = response.css("body *:not(script):not(style)::text").getall()
+                visible_text = " ".join([t.strip() for t in visible_text_elements if t.strip() and len(t.strip()) < 500])
+                
+                # Search for phone patterns in visible text
+                phone_matches = self.PHONE_PATTERN.findall(visible_text)
+                if phone_matches:
+                    # Filter out false positives (too short, looks like dates, etc.)
+                    for phone_candidate in phone_matches:
+                        phone_clean = phone_candidate.strip()
+                        # Count digits only (not characters)
+                        digits_only = re.sub(r'[^\d]', '', phone_clean)
+                        
+                        # Skip if too short or too long
+                        if len(digits_only) >= 10 and len(digits_only) <= 15:
+                            # Filter out false positives:
+                            # - Version numbers like "10.001"
+                            if re.match(r'^\d{1,2}\.\d{1,3}$', phone_clean):
+                                continue
+                            # - IP addresses
+                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
+                                continue
+                            # - Just 4 digits (years)
+                            if re.match(r'^\d{4}$', phone_clean):
+                                continue
+                            # - Employee count ranges like "201-500", "1-10", "11-50"
+                            if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
+                                continue
+                            # - Should look like a phone number (has +, 0, or proper format)
+                            if (phone_clean.startswith('+') or 
+                                phone_clean.startswith('0') or 
+                                re.match(r'^\+?\d{1,3}', phone_clean) or
+                                '(' in phone_clean or '-' in phone_clean):
+                                phone_from_linkedin = phone_clean
+                                self.logger.info(f"✅ Found phone in page text: {phone_from_linkedin}")
+                                break
+            except Exception as e:
+                self.logger.debug(f"Error searching for phone in visible text: {e}")
         
         email_selectors = [
             'a[href^="mailto:"]::attr(href)',
@@ -516,18 +811,48 @@ class SectorBasedScraperSpider(scrapy.Spider):
             '.org-top-card-summary-info-list__item:contains("@")::text',
         ]
         for selector in email_selectors:
-            email_text = response.css(selector).get()
-            if email_text:
-                # Extract email from mailto: link or text
-                if email_text.startswith('mailto:'):
-                    email_from_linkedin = email_text.replace('mailto:', '').strip()
-                else:
-                    email_match = self.EMAIL_PATTERN.search(email_text)
-                    if email_match:
-                        email_from_linkedin = email_match.group(0)
-                if email_from_linkedin:
-                    self.logger.info(f"✅ Found email on LinkedIn: {email_from_linkedin}")
-                    break
+            try:
+                email_text = response.css(selector).get()
+                if email_text:
+                    # Extract email from mailto: link or text
+                    if email_text.startswith('mailto:'):
+                        email_from_linkedin = email_text.replace('mailto:', '').strip()
+                    else:
+                        email_match = self.EMAIL_PATTERN.search(email_text)
+                        if email_match:
+                            email_from_linkedin = email_match.group(0)
+                    if email_from_linkedin:
+                        # Filter out false positives
+                        email_lower = email_from_linkedin.lower()
+                        if not any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@', 'no-reply@', 'placeholder@', '@example']):
+                            self.logger.info(f"✅ Found email on LinkedIn: {email_from_linkedin}")
+                            break
+            except Exception as e:
+                self.logger.debug(f"Error with email selector {selector}: {e}")
+                continue
+        
+        # If not found in selectors, try searching in visible text
+        if not email_from_linkedin:
+            try:
+                # Get visible text from the page
+                visible_text_elements = response.css("body *:not(script):not(style)::text").getall()
+                visible_text = " ".join([t.strip() for t in visible_text_elements if t.strip() and len(t.strip()) < 500])
+                
+                # Search for email patterns in visible text
+                email_matches = self.EMAIL_PATTERN.findall(visible_text)
+                if email_matches:
+                    # Filter out common false positives
+                    for email_candidate in email_matches:
+                        email_lower = email_candidate.lower()
+                        # Skip common false positives
+                        if not any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@', 'no-reply@', 'placeholder@', '@example', 'email@', 'mail@']):
+                            # Check if it's a valid email format
+                            if '.' in email_candidate.split('@')[1] if '@' in email_candidate else False:
+                                email_from_linkedin = email_candidate
+                                self.logger.info(f"✅ Found email in page text: {email_from_linkedin}")
+                                break
+            except Exception as e:
+                self.logger.debug(f"Error searching for email in visible text: {e}")
 
         # Company Details Block - Modern LinkedIn structure
         website = None
@@ -777,11 +1102,19 @@ class SectorBasedScraperSpider(scrapy.Spider):
             if not website.startswith('http'):
                 website = 'https://' + website
             
+            # Check if phone from LinkedIn is valid (not an employee count range)
+            phone_is_valid = True
+            if phone_from_linkedin:
+                # Check if it looks like an employee count range (e.g., "201-500", "1-10")
+                if re.match(r'^\d{1,4}-\d{1,4}$', phone_from_linkedin):
+                    phone_is_valid = False
+                    self.logger.info(f"⚠️  Invalid phone from LinkedIn (looks like employee count): {phone_from_linkedin}, will search website")
+            
             # Initialize tracking for this company
             company_key = website
             self.companies_in_progress[company_key] = {
                 'company_name': company_name,
-                'phone': phone_from_linkedin or "",
+                'phone': phone_from_linkedin if phone_is_valid else "",
                 'website': website,
                 'emails': set([email_from_linkedin] if email_from_linkedin else []),
                 'pages_processed': 0,
@@ -838,13 +1171,34 @@ class SectorBasedScraperSpider(scrapy.Spider):
         emails_found = {email.lower() for email in emails_found}
         
         # Filter out common non-email patterns (like image URLs, CSS, JS)
-        emails_found = {
-            email for email in emails_found
-            if not email.startswith('//') and '@' in email
-            and not email.endswith('.png') and not email.endswith('.jpg')
-            and not email.endswith('.gif') and not email.endswith('.css')
-            and not email.endswith('.js')
-        }
+        filtered_emails = set()
+        for email in emails_found:
+            # Basic checks
+            if email.startswith('//') or '@' not in email:
+                continue
+            if email.endswith(('.png', '.jpg', '.gif', '.css', '.js')):
+                continue
+            # False positive checks
+            email_lower = email.lower()
+            if any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@', 'no-reply@', 'placeholder@', '@example', 'email@', 'mail@']):
+                continue
+            # Email format validation
+            if '@' in email:
+                parts = email.split('@')
+                if len(parts) == 2:
+                    local_part, domain = parts
+                    # Local part boş olmamalı
+                    if len(local_part) == 0:
+                        continue
+                    # Domain'de nokta olmalı
+                    if '.' not in domain:
+                        continue
+                    # Domain name boş olmamalı
+                    domain_parts = domain.split('.')
+                    if len(domain_parts[0]) == 0:
+                        continue
+                    filtered_emails.add(email)
+        emails_found = filtered_emails
         
         if emails_found:
             self.logger.info(f"Found {len(emails_found)} emails on {response.url}")
@@ -852,15 +1206,49 @@ class SectorBasedScraperSpider(scrapy.Spider):
         
         # Extract phone numbers from page text
         phones_found = self.PHONE_PATTERN.findall(page_text)
-        if phones_found and not company_data['phone']:
-            # Use the first valid phone number found
-            for phone in phones_found:
-                # Clean up phone number
-                phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
-                if len(phone_clean) >= 10:  # Minimum phone number length
-                    company_data['phone'] = phone_clean
-                    self.logger.info(f"Found phone number on {response.url}: {phone_clean}")
-                    break
+        if phones_found:
+            # Only update if we don't have a valid phone yet
+            current_phone = company_data.get('phone', '')
+            # Check if current phone is invalid (employee count range or empty)
+            should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+            
+            if should_update_phone:
+                # Use the first valid phone number found
+                for phone in phones_found:
+                    # Clean up phone number
+                    phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                    # Remove extra spaces
+                    phone_clean = re.sub(r'\s+', ' ', phone_clean)
+                    
+                    # Filter out false positives:
+                    # - Too short (less than 10 digits)
+                    # - Looks like a date/year (4 digits)
+                    # - Too many digits (likely not a phone)
+                    digits_only = re.sub(r'[^\d]', '', phone_clean)
+                    if len(digits_only) >= 10 and len(digits_only) <= 15:
+                        # Filter out false positives:
+                        # - Version numbers like "10.001"
+                        if re.match(r'^\d{1,2}\.\d{1,3}$', phone_clean):
+                            continue
+                        # - IP addresses
+                        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
+                            continue
+                        # - Just 4 digits (years)
+                        if re.match(r'^\d{4}$', phone_clean):
+                            continue
+                        # - Employee count ranges like "201-500", "1-10"
+                        if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
+                            continue
+                        # Additional validation: should contain country code or area code pattern
+                        # Turkish: starts with 0 or +90, or has area code pattern
+                        # International: starts with + or has country code
+                        if (phone_clean.startswith('+') or 
+                            phone_clean.startswith('0') or 
+                            re.match(r'^\+?\d{1,3}', phone_clean) or
+                            '(' in phone_clean or '-' in phone_clean):
+                            company_data['phone'] = phone_clean
+                            self.logger.info(f"✅ Found phone number on {response.url}: {phone_clean}")
+                            break
         
         # Check if all pages have been processed
         if company_data['pages_processed'] >= company_data['total_pages']:
