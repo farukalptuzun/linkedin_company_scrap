@@ -229,6 +229,14 @@ class SeleniumMiddleware:
                     pass
                 time.sleep(5)  # Extra wait for JavaScript to render content
                 
+                # Check if LinkedIn redirected/normalized the URL (especially for pagination)
+                final_url = self.driver.current_url
+                if final_url != request.url:
+                    spider.logger.info(f"🔁 LinkedIn redirect/normalize: requested={request.url} final={final_url}")
+                    # If start parameter was removed, this could cause duplicate results
+                    if 'start=' in request.url and 'start=' not in final_url:
+                        spider.logger.warning(f"⚠️  LinkedIn removed start parameter! This may cause duplicate results.")
+                
                 # Login sayfasına yönlendirilmiş mi kontrol et
                 if 'login' in self.driver.current_url.lower() or 'authwall' in self.driver.current_url.lower():
                     spider.logger.error("❌ LinkedIn login sayfasına yönlendirildi. Cookie'ler expire olmuş olabilir.")

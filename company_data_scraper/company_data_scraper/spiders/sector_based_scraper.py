@@ -55,10 +55,11 @@ class SectorBasedScraperSpider(scrapy.Spider):
         'education': ['5'],  # Eğitim (approximate)
     }
 
-    def __init__(self, sector: str = "", location: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
+    def __init__(self, sector: str = "", location: str = "", geo_id: str = "", limit: str = "20", max_pages: str = "3", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sector = (sector or "").strip()
         self.location = (location or "").strip()
+        self.geo_id = (geo_id or "").strip()
         
         if not self.sector:
             raise ValueError("sector is required. Example: scrapy crawl sector_based_scraper -a sector='Technology'")
@@ -75,6 +76,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
 
         self._seen_company_urls: set[str] = set()
         self.processed_count = 0
+        self.enqueued_count = 0  # Track enqueued requests (for pagination decision)
         # Track companies being scraped (website -> company data)
         self.companies_in_progress = {}
         # Track consecutive pages with no new URLs
@@ -95,11 +97,19 @@ class SectorBasedScraperSpider(scrapy.Spider):
             for idx, sector_id in enumerate(sector_ids, 1):
                 search_url = f"https://www.linkedin.com/search/results/companies/?f_I={sector_id}"
                 
-                # Add location to search URL if provided
-                if self.location:
-                    encoded_location = quote_plus(self.location)
-                    search_url += f"&geoId=&location={encoded_location}"
-                    self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} + location '{self.location}': {search_url}")
+                # Location facet için companyHqGeo kullanılmalı. Format: companyHqGeo=["102424322"]
+                # LinkedIn URL'de: companyHqGeo=%5B%22102424322%22%5D (URL encoded)
+                if self.geo_id:
+                    # LinkedIn companyHqGeo formatı: ["102424322"] şeklinde array
+                    company_hq_geo_value = f'["{self.geo_id}"]'
+                    search_url += f"&companyHqGeo={quote_plus(company_hq_geo_value)}"
+                    self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} + companyHqGeo '{self.geo_id}': {search_url}")
+                elif self.location:
+                    self.logger.warning(
+                        f"⚠️  location='{self.location}' verildi ama geo_id yok. LinkedIn location facet companyHqGeo ister; "
+                        "location string'i URL'ye eklemiyorum (aksi halde aynı sonuçlar dönebilir)."
+                    )
+                    self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} (no location filter): {search_url}")
                 else:
                     self.logger.info(f"🔍 [{idx}/{len(sector_ids)}] Starting search with sector ID {sector_id} (no location filter): {search_url}")
                 
@@ -133,12 +143,21 @@ class SectorBasedScraperSpider(scrapy.Spider):
             encoded_sector = quote_plus(self.sector)
             search_url = f"https://www.linkedin.com/search/results/companies/?keywords={encoded_sector}"
             
-            # Add location to search URL if provided
-            if self.location:
-                encoded_location = quote_plus(self.location)
-                search_url += f"&geoId=&location={encoded_location}"
-            
-            self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search: {search_url}")
+            # Location facet için companyHqGeo kullanılmalı. Format: companyHqGeo=["102424322"]
+            # LinkedIn URL'de: companyHqGeo=%5B%22102424322%22%5D (URL encoded)
+            if self.geo_id:
+                # LinkedIn companyHqGeo formatı: ["102424322"] şeklinde array
+                company_hq_geo_value = f'["{self.geo_id}"]'
+                search_url += f"&companyHqGeo={quote_plus(company_hq_geo_value)}"
+                self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search with companyHqGeo '{self.geo_id}': {search_url}")
+            elif self.location:
+                self.logger.warning(
+                    f"⚠️  location='{self.location}' verildi ama geo_id yok. LinkedIn location facet companyHqGeo ister; "
+                    "location string'i URL'ye eklemiyorum (aksi halde aynı sonuçlar dönebilir)."
+                )
+                self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search (no location filter): {search_url}")
+            else:
+                self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search: {search_url}")
             
             cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
@@ -205,9 +224,9 @@ class SectorBasedScraperSpider(scrapy.Spider):
         
         # Log which sector ID search this is
         if sector_id_index and total_sector_ids:
-            self.logger.info(f"📊 Processing page {page} from sector ID {sector_id} ({sector_id_index}/{total_sector_ids}) - Processed: {self.processed_count}/{self.limit}")
+            self.logger.info(f"📊 Processing page {page} from sector ID {sector_id} ({sector_id_index}/{total_sector_ids}) - Enqueued: {self.enqueued_count}/{self.limit}, Processed: {self.processed_count}/{self.limit}")
         else:
-            self.logger.info(f"📊 Processing page {page} - Processed: {self.processed_count}/{self.limit}")
+            self.logger.info(f"📊 Processing page {page} - Enqueued: {self.enqueued_count}/{self.limit}, Processed: {self.processed_count}/{self.limit}")
 
         # Multiple strategies to extract company URLs from LinkedIn search results
         # Strategy 1: Try LinkedIn-specific CSS selectors for search results
@@ -264,9 +283,9 @@ class SectorBasedScraperSpider(scrapy.Spider):
         self.logger.info(f"Page {page}: {new_urls_count} new URLs, {len(normalized_urls) - new_urls_count} duplicates")
 
         for company_url in normalized_urls:
-            # Check limit before processing more companies
-            if self.processed_count >= self.limit:
-                self.logger.info(f"Reached limit of {self.limit} companies")
+            # Check limit before processing more companies (use enqueued_count for async-aware limit check)
+            if self.enqueued_count >= self.limit:
+                self.logger.info(f"Reached limit of {self.limit} companies (enqueued: {self.enqueued_count})")
                 return
             
             # Normalize URL for duplicate checking (remove /about/ suffix)
@@ -284,6 +303,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 about_url = company_url.rstrip('/') + '/about/'
             
             self.logger.info(f"🔍 Requesting company profile: {about_url} (base: {base_url})")
+            self.enqueued_count += 1  # Track enqueued requests for pagination decision
             yield scrapy.Request(
                 url=about_url,
                 callback=self.parse_company_profile,
@@ -309,21 +329,22 @@ class SectorBasedScraperSpider(scrapy.Spider):
         max_consecutive_duplicates = 10  # Increased from 5 to 10
         
         # AGGRESSIVE PAGINATION: Always continue if we haven't reached limit
+        # Use enqueued_count instead of processed_count for async-aware pagination decision
         # Only stop if we've hit too many consecutive duplicates OR reached max pages
         should_paginate = (
-            self.processed_count < self.limit and 
+            self.enqueued_count < self.limit and 
             self.consecutive_duplicate_pages < max_consecutive_duplicates and
             page < effective_max_pages
         )
         
         # Detailed pagination decision logging
-        self.logger.info(f"🔍 Pagination check: processed={self.processed_count}/{self.limit}, consecutive_duplicates={self.consecutive_duplicate_pages}/{max_consecutive_duplicates}, page={page}/{effective_max_pages}")
+        self.logger.info(f"🔍 Pagination check: enqueued={self.enqueued_count}/{self.limit}, processed={self.processed_count}/{self.limit}, consecutive_duplicates={self.consecutive_duplicate_pages}/{max_consecutive_duplicates}, page={page}/{effective_max_pages}")
         self.logger.info(f"🔍 should_paginate={should_paginate}")
         
         if not should_paginate:
             reasons = []
-            if self.processed_count >= self.limit:
-                reasons.append(f"reached_limit({self.processed_count}>={self.limit})")
+            if self.enqueued_count >= self.limit:
+                reasons.append(f"reached_limit(enqueued={self.enqueued_count}>={self.limit})")
             if self.consecutive_duplicate_pages >= max_consecutive_duplicates:
                 reasons.append(f"too_many_duplicates({self.consecutive_duplicate_pages}>={max_consecutive_duplicates})")
             if page >= effective_max_pages:
@@ -334,15 +355,22 @@ class SectorBasedScraperSpider(scrapy.Spider):
             next_page = page + 1
             use_cache = response.meta.get("use_cache", False)
             
-            # Get original search_url without start parameter (from meta)
+            # Get original search_url without pagination parameters (from meta)
             # This ensures we always use the base URL for pagination
             original_search_url = search_url
-            # Remove any existing start parameter from the URL
+            # Remove any existing start or page parameter from the URL
             if '&start=' in original_search_url or '?start=' in original_search_url:
                 original_search_url = re.sub(r'[&?]start=\d+', '', original_search_url)
+            if '&page=' in original_search_url:
+                original_search_url = re.sub(r'&page=\d+', '', original_search_url)
+            if '?page=' in original_search_url:
+                original_search_url = re.sub(r'\?page=\d+', '?', original_search_url)
+                # Clean up trailing ? if no other params
+                if original_search_url.endswith('?'):
+                    original_search_url = original_search_url.rstrip('?')
             
             # Log pagination decision
-            self.logger.info(f"📊 Page {page} summary: {len(normalized_urls)} URLs found, {new_urls_count} new, {self.processed_count}/{self.limit} processed, {self.consecutive_duplicate_pages} consecutive duplicates")
+            self.logger.info(f"📊 Page {page} summary: {len(normalized_urls)} URLs found, {new_urls_count} new, enqueued={self.enqueued_count}/{self.limit}, processed={self.processed_count}/{self.limit}, {self.consecutive_duplicate_pages} consecutive duplicates")
             
             if use_cache:
                 # Use Google Cache for pagination
@@ -351,18 +379,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 next_url = next_cache_url
             else:
                 # Use direct LinkedIn URL for pagination
-                # LinkedIn uses start parameter for pagination: start=0, start=10, start=20, etc.
-                start_param = (next_page - 1) * 10
+                # LinkedIn uses page parameter for pagination: page=1, page=2, page=3, etc.
+                # Format: &page=4 (not start=10, start=20)
                 
                 # Handle both f_I (sector ID) and keywords search formats
                 if '?' in original_search_url:
-                    next_search_url = f"{original_search_url}&start={start_param}"
+                    next_search_url = f"{original_search_url}&page={next_page}"
                 else:
-                    next_search_url = f"{original_search_url}?start={start_param}"
+                    next_search_url = f"{original_search_url}?page={next_page}"
                 
                 next_url = next_search_url
                 sector_info = f" (sector ID: {sector_id})" if sector_id != "N/A" else ""
-                self.logger.info(f"📄 Requesting page {next_page}{sector_info} (start={start_param}, found {new_urls_count} new URLs, processed {self.processed_count}/{self.limit}, total URLs on page: {len(normalized_urls)})")
+                self.logger.info(f"📄 Requesting page {next_page}{sector_info} (found {new_urls_count} new URLs, enqueued={self.enqueued_count}/{self.limit}, processed={self.processed_count}/{self.limit}, total URLs on page: {len(normalized_urls)})")
                 self.logger.info(f"📄 Next URL: {next_url}")
             
             # Create and yield pagination request
