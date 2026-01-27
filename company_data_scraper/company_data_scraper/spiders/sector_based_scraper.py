@@ -249,9 +249,13 @@ class SectorBasedScraperSpider(scrapy.Spider):
         Returns: {emails:set[str], phones:list[str], location:str}
         """
         footer_html_text = ""
+        footer_element = None
+        
+        # Find footer element
         for sel in self.FOOTER_SELECTORS:
             footer = response.css(sel)
             if footer:
+                footer_element = footer
                 txts = footer.css("::text").getall()
                 footer_html_text = " ".join(t.strip() for t in txts if t.strip())
                 break
@@ -261,7 +265,10 @@ class SectorBasedScraperSpider(scrapy.Spider):
         location = ""
 
         if footer_html_text:
+            # Extract emails from footer text
             emails.update({e.lower() for e in self.EMAIL_PATTERN.findall(footer_html_text)})
+            
+            # Extract phones from footer text
             for m in self.PHONE_PATTERN.findall(footer_html_text):
                 cand = re.sub(r"\s+", " ", m).strip()
                 if self._is_plausible_phone(cand, source="website_text", context_text=footer_html_text):
@@ -269,19 +276,85 @@ class SectorBasedScraperSpider(scrapy.Spider):
 
         # Also prefer explicit links inside footer
         for href in response.css("footer a[href^='mailto:']::attr(href)").getall():
-            email = href.replace("mailto:", "").strip()
+            email = href.replace("mailto:", "").split("?")[0].strip()
             if email:
                 emails.add(email.lower())
+        
         for href in response.css("footer a[href^='tel:']::attr(href)").getall():
-            phone = href.replace("tel:", "").strip()
-            if phone and self._is_plausible_phone(phone, source="website_tel"):
-                phones.append(phone)
+            phone = href.replace("tel:", "").split("?")[0].strip()
+            if phone:
+                phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                if self._is_plausible_phone(phone_clean, source="website_tel", context_text=""):
+                    phones.append(phone_clean)
 
-        # Location in footer (best effort)
-        if footer_html_text:
-            loc = self._extract_location_from_website(response)
-            if loc:
-                location = loc
+        # Location extraction from footer
+        if footer_element:
+            # Try to find address/location in footer
+            # Look for address tags
+            address_texts = footer_element.css("address ::text").getall()
+            if address_texts:
+                location = " ".join(t.strip() for t in address_texts if t.strip())
+            
+            # Look for common location patterns
+            if not location:
+                # Check for text containing city names or address patterns
+                # Look for patterns like "İstanbul", "Istanbul", "Ankara", etc.
+                city_patterns = [
+                    r'([A-ZÇĞİÖŞÜ][a-zçğıöşü]+(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü]+)*),\s*(?:Türkiye|Turkey|İstanbul|Istanbul|Ankara|İzmir|Izmir)',
+                    r'(Nakkaştepe|Levent|Maslak|Ataşehir|Kadıköy|Beşiktaş|Şişli|Beyoğlu)[^,]*,\s*[^,]+,\s*İstanbul',
+                    r'([A-ZÇĞİÖŞÜ][a-zçğıöşü]+\s+(?:Sokak|Sok\.|Cadde|Cad\.|Mahalle|Mah\.|No\.|No)[^,]*,\s*[^,]+,\s*[^,]+)',
+                ]
+                
+                for pattern in city_patterns:
+                    match = re.search(pattern, footer_html_text, re.IGNORECASE)
+                    if match:
+                        location = match.group(0).strip()
+                        # Clean up location
+                        location = re.sub(r'\s+', ' ', location)
+                        # Remove common footer noise
+                        location = re.sub(r'(cookie|privacy|kvkk|terms|copyright|follow|takip).*', '', location, flags=re.IGNORECASE).strip()
+                        if len(location) >= 10 and len(location) <= 200:
+                            break
+            
+            # If still no location, try to extract from structured data in footer
+            if not location:
+                address_elements = footer_element.css("[itemprop='address'], [itemtype*='PostalAddress'], [class*='address'], [id*='address']")
+                if address_elements:
+                    address_texts = address_elements.css("::text").getall()
+                    if address_texts:
+                        location = " ".join(t.strip() for t in address_texts if t.strip())
+                        location = re.sub(r'\s+', ' ', location).strip()
+                        if len(location) > 200:
+                            location = location[:200]
+            
+            # Fallback: try general location extraction method on footer
+            if not location:
+                # Use the general location extraction but limit to footer
+                try:
+                    # Create a mock response with only footer content for location extraction
+                    footer_address_texts = footer_element.css("address ::text").getall()
+                    if not footer_address_texts:
+                        # Try common address containers in footer
+                        footer_address_selectors = [
+                            "[class*='address'] ::text",
+                            "[id*='address'] ::text",
+                            "[class*='location'] ::text",
+                            "[id*='location'] ::text",
+                        ]
+                        for sel in footer_address_selectors:
+                            footer_address_texts = footer_element.css(sel).getall()
+                            if footer_address_texts:
+                                break
+                    
+                    if footer_address_texts:
+                        location = " ".join(t.strip() for t in footer_address_texts if t.strip())
+                        location = re.sub(r'\s+', ' ', location).strip()
+                        # Remove common footer noise
+                        location = re.sub(r'(cookie|privacy|kvkk|terms|copyright|follow|takip|social|media).*', '', location, flags=re.IGNORECASE).strip()
+                        if len(location) < 10 or len(location) > 200:
+                            location = ""
+                except Exception:
+                    pass
 
         # Filter out obvious non-business emails
         filtered_emails = set()
@@ -1611,24 +1684,31 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     company_data["location"] = loc
                     self.logger.info(f"📍 Found location on {response.url}: {loc}")
 
-        # === 8. FOOTER EXTRACTION (only for contact-like pages) ===
-        url_lower = (response.url or "").lower()
-        if any(marker in url_lower for marker in self.CONTACT_LIKE_PATH_MARKERS):
-            footer_info = self._extract_from_footer(response)
-            if footer_info.get("emails"):
-                company_data["emails"].update(footer_info["emails"])
-            current_phone = company_data.get("phone", "")
-            should_update_phone = not current_phone or re.match(r"^\d{1,4}-\d{1,4}$", current_phone or "")
-            if should_update_phone and footer_info.get("phones"):
-                for p in footer_info["phones"]:
-                    if self._is_plausible_phone(p, source="website_text", context_text="footer"):
-                        company_data["phone"] = p
-                        self.logger.info(f"✅ Found phone number in footer on {response.url}: {p}")
-                        break
-            if not company_data.get("location_from_linkedin") and not company_data.get("location"):
-                if footer_info.get("location"):
-                    company_data["location"] = footer_info["location"]
-                    self.logger.info(f"📍 Found location in footer on {response.url}: {footer_info['location']}")
+        # === 8. FOOTER EXTRACTION (ALL PAGES - Footer usually contains contact info) ===
+        # Footer extraction should work on ALL pages, not just contact pages
+        # Footer typically contains company contact information on every page
+        footer_info = self._extract_from_footer(response)
+        
+        # Extract emails from footer
+        if footer_info.get("emails"):
+            company_data["emails"].update(footer_info["emails"])
+            self.logger.info(f"📧 Found {len(footer_info['emails'])} emails in footer on {response.url}")
+        
+        # Update phone if missing/invalid
+        current_phone = company_data.get("phone", "")
+        should_update_phone = not current_phone or re.match(r"^\d{1,4}-\d{1,4}$", current_phone or "")
+        if should_update_phone and footer_info.get("phones"):
+            for p in footer_info["phones"]:
+                if self._is_plausible_phone(p, source="website_text", context_text="footer"):
+                    company_data["phone"] = p
+                    self.logger.info(f"✅ Found phone number in footer on {response.url}: {p}")
+                    break
+        
+        # Update location if still empty and LinkedIn didn't provide
+        if not company_data.get("location_from_linkedin") and not company_data.get("location"):
+            if footer_info.get("location"):
+                company_data["location"] = footer_info["location"]
+                self.logger.info(f"📍 Found location in footer on {response.url}: {footer_info['location']}")
         
         # Check if all pages have been processed
         if company_data['pages_processed'] >= company_data['total_pages']:
