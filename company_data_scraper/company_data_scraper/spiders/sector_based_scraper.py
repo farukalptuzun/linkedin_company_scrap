@@ -3,6 +3,7 @@ import scrapy
 from urllib.parse import quote_plus, urljoin
 from datetime import datetime
 from company_data_scraper.items import LeadItem
+import json
 
 
 class SectorBasedScraperSpider(scrapy.Spider):
@@ -19,13 +20,23 @@ class SectorBasedScraperSpider(scrapy.Spider):
     )
     
     # Phone regex pattern (matches various phone formats including Turkish formats)
+    # NOTE: We intentionally avoid matching long bare digit sequences too aggressively;
+    # final validation is done in _is_plausible_phone() with context-aware heuristics.
+    # Enhanced patterns for better coverage:
     PHONE_PATTERN = re.compile(
-        r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}'  # International formats
-        r'|(?:\+90|0)?\s*\(?\d{3}\)?\s*\d{3}\s*\d{2}\s*\d{2}'  # Turkish format: 0212 123 45 67
-        r'|\+90\s*\d{3}\s*\d{3}\s*\d{2}\s*\d{2}'  # +90 212 123 45 67
-        r'|0\d{3}\s*\d{3}\s*\d{2}\s*\d{2}'  # 02121234567
-        r'|\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'  # US/International: +1 (212) 123-4567
-        r'|\+?\d{1,3}[-.\s]?\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{2,4}'  # Flexible international
+        # Turkish formats (most common)
+        r'(?:\+90|0)\s*\(?\d{3}\)?\s*\d{3}[\s\-.]?\d{2}[\s\-.]?\d{2}'  # +90 212 123 45 67, 0(212) 123 45 67
+        r'|(?:\+90|0)\s*\d{3}[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{2}'  # +90 212 123 45 67 (no parentheses)
+        r'|0\d{3}[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{2}'  # 02121234567 variations
+        r'|\+90\d{10}'  # +902121234567 (no spaces)
+        r'|0\d{10}'  # 02121234567 (no spaces)
+        # International formats
+        r'|\+\d{1,3}[\s\-.]?\(?\d{1,4}\)?[\s\-.]?\d{2,4}[\s\-.]?\d{2,4}[\s\-.]?\d{2,4}'  # +1 (212) 123-4567
+        r'|\+?\d{1,3}[\s\-.]?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}'  # US/International: +1 (212) 123-4567
+        r'|\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}'  # (212) 123-4567
+        # Flexible patterns (with separators)
+        r'|\d{2,4}[\s\-./]\d{2,4}[\s\-./]\d{2,4}[\s\-./]\d{2,4}'  # 0212 123 45 67, 0212-123-45-67
+        r'|\d{3}[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{2}'  # Turkish without leading 0/+90
     )
     
     # Common contact/about page paths to check (optimized: only most common paths)
@@ -39,6 +50,248 @@ class SectorBasedScraperSpider(scrapy.Spider):
         '/about',  # About
         '/about-us',  # About us
     ]
+
+    FOOTER_SELECTORS = [
+        "footer",
+        "#footer",
+        ".footer",
+        '[role="contentinfo"]',
+        ".site-footer",
+        ".main-footer",
+        "#site-footer",
+    ]
+
+    CONTACT_LIKE_PATH_MARKERS = (
+        "/contact",
+        "/contact-us",
+        "/iletisim",
+        "/iletisim-bilgileri",
+        "/hakkimizda",
+        "/about",
+        "/about-us",
+    )
+
+    @staticmethod
+    def _digits_only(value: str) -> str:
+        return re.sub(r"[^\d]", "", value or "")
+
+    @classmethod
+    def _is_plausible_phone(cls, phone_candidate: str, *, source: str, context_text: str = "") -> bool:
+        """
+        Strong phone validation to reduce false positives like IDs, dates, employee ranges, etc.
+        `source` is one of: 'linkedin_tel', 'linkedin_text', 'website_tel', 'website_text'.
+        """
+        if not phone_candidate:
+            return False
+
+        phone_candidate = re.sub(r"\s+", " ", phone_candidate.strip())
+        digits = cls._digits_only(phone_candidate)
+
+        # Basic length checks
+        if len(digits) < 10 or len(digits) > 15:
+            return False
+
+        # Obvious false positives
+        if re.match(r"^\d{1,2}\.\d{1,3}$", phone_candidate):  # version-like 10.001
+            return False
+        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", phone_candidate):  # IP
+            return False
+        if re.match(r"^\d{4}$", digits):  # year
+            return False
+        if re.match(r"^\d{1,4}-\d{1,4}$", phone_candidate):  # ranges like 201-500
+            return False
+
+        # Source-specific strictness
+        if source in ("linkedin_text", "website_text"):
+            # If it's just a bare digit run, require either strong prefix or separators/parentheses
+            has_separators = any(ch in phone_candidate for ch in (" ", "-", "(", ")", ".", "+", "/"))
+            has_tr_prefix = phone_candidate.strip().startswith(("+90", "0"))
+            is_tr_mobile_plain = (len(digits) == 10 and digits.startswith("5"))  # 5xx... (without leading 0)
+            is_tr_landline = (len(digits) == 10 and digits.startswith(("2", "3", "4")))  # Turkish landline without 0
+
+            # For plain text matches we require either explicit formatting or context keywords
+            context = (context_text or "").lower()
+            has_contact_context = any(
+                kw in context
+                for kw in (
+                    "tel",
+                    "telefon",
+                    "phone",
+                    "call",
+                    "whatsapp",
+                    "iletişim",
+                    "contact",
+                    "müşteri hizmet",
+                    "customer service",
+                    "numara",
+                    "number",
+                    "ara",
+                    "bize ulaş",
+                    "reach us",
+                    "get in touch",
+                    "bize ulaşın",
+                )
+            )
+
+            # More lenient: accept if has prefix, separators, or context, or Turkish format
+            if not (has_tr_prefix or has_separators or (is_tr_mobile_plain and has_contact_context) or (is_tr_landline and has_contact_context)):
+                return False
+
+        # For tel: links, we can be more permissive but still avoid obvious junk
+        if source in ("linkedin_tel", "website_tel"):
+            # tel links sometimes contain extensions; keep base checks only
+            return True
+
+        return True
+
+    @classmethod
+    def _extract_phones_from_json_ld(cls, response) -> list[str]:
+        """
+        Best-effort extraction from JSON-LD blocks (common on some sites; occasionally on LinkedIn proxies).
+        """
+        phones: list[str] = []
+        try:
+            scripts = response.css('script[type="application/ld+json"]::text').getall()
+        except Exception:
+            scripts = []
+        for raw in scripts:
+            if not raw or len(raw) > 500_000:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            def walk(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        lk = str(k).lower()
+                        if lk in ("telephone", "tel", "phone", "contactpoint"):
+                            # contactPoint can be object/list; recurse
+                            walk(v)
+                        else:
+                            walk(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        walk(it)
+                else:
+                    if isinstance(obj, str):
+                        s = obj.strip()
+                        if s.startswith("tel:"):
+                            s = s.replace("tel:", "").strip()
+                        if cls._is_plausible_phone(s, source="website_tel"):
+                            phones.append(s)
+
+            walk(data)
+        # De-dupe keep order
+        out = []
+        seen = set()
+        for p in phones:
+            key = cls._digits_only(p)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(p)
+        return out
+
+    @classmethod
+    def _extract_location_from_website(cls, response) -> str:
+        """
+        Attempt to extract a human-readable location/address from contact/about pages.
+        """
+        # Prefer <address> and schema.org-style markup
+        candidates = []
+        try:
+            address_texts = response.css("address ::text").getall()
+            if address_texts:
+                candidates.append(" ".join(t.strip() for t in address_texts if t.strip()))
+        except Exception:
+            pass
+
+        # Common address containers
+        selectors = [
+            "[itemprop='address'] ::text",
+            "[itemtype*='PostalAddress'] ::text",
+            "[class*='address'] ::text",
+            "[id*='address'] ::text",
+            "[class*='location'] ::text",
+            "[id*='location'] ::text",
+            "[class*='contact'] ::text",
+            "[id*='contact'] ::text",
+        ]
+        for sel in selectors:
+            try:
+                txts = response.css(sel).getall()
+                if txts:
+                    candidates.append(" ".join(t.strip() for t in txts if t.strip()))
+            except Exception:
+                continue
+
+        # Heuristic clean-up: choose the best-looking candidate
+        def normalize_addr(s: str) -> str:
+            s = re.sub(r"\s+", " ", s or "").strip()
+            s = re.sub(r"\b(cookie|privacy|kvkk|terms|copyright)\b.*", "", s, flags=re.IGNORECASE).strip()
+            return s
+
+        cleaned = [normalize_addr(c) for c in candidates if c and len(c.strip()) >= 10]
+        cleaned = [c for c in cleaned if len(c) <= 300]
+        if not cleaned:
+            return ""
+
+        # Prefer candidates containing city-like separators
+        for c in cleaned:
+            if "," in c or "Türkiye" in c or "Turkey" in c:
+                return c
+        return cleaned[0]
+
+    def _extract_from_footer(self, response) -> dict:
+        """
+        Extract contact info from the footer (emails, phones, location) of a page.
+        Returns: {emails:set[str], phones:list[str], location:str}
+        """
+        footer_html_text = ""
+        for sel in self.FOOTER_SELECTORS:
+            footer = response.css(sel)
+            if footer:
+                txts = footer.css("::text").getall()
+                footer_html_text = " ".join(t.strip() for t in txts if t.strip())
+                break
+
+        emails = set()
+        phones = []
+        location = ""
+
+        if footer_html_text:
+            emails.update({e.lower() for e in self.EMAIL_PATTERN.findall(footer_html_text)})
+            for m in self.PHONE_PATTERN.findall(footer_html_text):
+                cand = re.sub(r"\s+", " ", m).strip()
+                if self._is_plausible_phone(cand, source="website_text", context_text=footer_html_text):
+                    phones.append(cand)
+
+        # Also prefer explicit links inside footer
+        for href in response.css("footer a[href^='mailto:']::attr(href)").getall():
+            email = href.replace("mailto:", "").strip()
+            if email:
+                emails.add(email.lower())
+        for href in response.css("footer a[href^='tel:']::attr(href)").getall():
+            phone = href.replace("tel:", "").strip()
+            if phone and self._is_plausible_phone(phone, source="website_tel"):
+                phones.append(phone)
+
+        # Location in footer (best effort)
+        if footer_html_text:
+            loc = self._extract_location_from_website(response)
+            if loc:
+                location = loc
+
+        # Filter out obvious non-business emails
+        filtered_emails = set()
+        for e in emails:
+            el = e.lower()
+            if any(skip in el for skip in ["example.com", "test@", "noreply@", "no-reply@", "placeholder@", "@example", "email@", "mail@"]):
+                continue
+            filtered_emails.add(e)
+
+        return {"emails": filtered_emails, "phones": phones, "location": location}
     
     # Sector/Industry mapping for Turkish-English matching
     SECTOR_MAPPINGS = {
@@ -372,7 +625,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             else:
                 self.logger.info(f"⚠️  No LinkedIn sector ID found for '{sector_key}', using keywords search: {search_url}")
             
-        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
+            cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{search_url}"
 
         # Try direct LinkedIn first (better for JavaScript-rendered content)
         yield scrapy.Request(
@@ -667,7 +920,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             return
         
         sector = response.meta.get("sector", self.sector)
-        location = response.meta.get("location", self.location)
+        requested_location = response.meta.get("location", self.location)
         company_url = response.meta.get("company_url", response.url)
 
         # Company Name - Multiple fallback selectors for LinkedIn's different layouts
@@ -727,58 +980,24 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     phone_match = self.PHONE_PATTERN.search(phone_text)
                     if phone_match:
                         phone_candidate = phone_match.group(0).strip()
-                        
-                        # Clean up phone number (remove extra spaces, normalize)
-                        phone_candidate = re.sub(r'\s+', ' ', phone_candidate)
-                        
-                        # Count digits only (not characters)
-                        digits_only = re.sub(r'[^\d]', '', phone_candidate)
-                        
-                        # Skip if too short or too long
-                        if len(digits_only) < 10 or len(digits_only) > 15:
-                            continue
-                        
-                        # Filter out false positives:
-                        # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
-                        #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
-                        if re.match(r'^\d{1,2}\.\d{1,5}$', phone_candidate):
-                            self.logger.debug(f"Skipping version number: {phone_candidate}")
-                            continue
-                        # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
-                        #   Check if it starts with a version number pattern
-                        phone_parts = phone_candidate.split()
-                        if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
-                            self.logger.debug(f"Skipping version number with text: {phone_candidate}")
-                            continue
-                        # - IP addresses
-                        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_candidate):
-                            self.logger.debug(f"Skipping IP address: {phone_candidate}")
-                            continue
-                        # - Just 4 digits (years)
-                        if re.match(r'^\d{4}$', phone_candidate):
-                            self.logger.debug(f"Skipping year: {phone_candidate}")
-                            continue
-                        # - Employee count ranges like "201-500", "1-10", "11-50", "51-200"
-                        if re.match(r'^\d{1,4}-\d{1,4}$', phone_candidate):
-                            self.logger.debug(f"Skipping employee count range: {phone_candidate}")
-                            continue
-                        # - Email-like patterns (contains @ or looks like email)
-                        if '@' in phone_candidate or re.search(r'[a-zA-Z]', phone_candidate):
-                            self.logger.debug(f"Skipping email-like pattern: {phone_candidate}")
-                            continue
-                        # - Check if phone has multiple parts separated by spaces (might be version + text)
-                        #   If it has more than 3 parts, it's likely not a phone number
-                        if len(phone_parts) > 3:
-                            self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_candidate}")
-                            continue
-                        
-                        # If we get here, it's a valid phone number
-                        phone_from_linkedin = phone_candidate
-                        self.logger.info(f"✅ Found phone on LinkedIn: {phone_from_linkedin}")
-                        break
+                        phone_candidate = re.sub(r"\s+", " ", phone_candidate)
+                        if self._is_plausible_phone(phone_candidate, source="linkedin_tel"):
+                            phone_from_linkedin = phone_candidate
+                            self.logger.info(f"✅ Found phone on LinkedIn (tel link): {phone_from_linkedin}")
+                            break
             except Exception as e:
                 self.logger.debug(f"Error with phone selector {selector}: {e}")
                 continue
+
+        # Try JSON-LD (rare on LinkedIn itself, but useful when pages are proxied/cached or for websites)
+        if not phone_from_linkedin:
+            try:
+                jsonld_phones = self._extract_phones_from_json_ld(response)
+                if jsonld_phones:
+                    phone_from_linkedin = jsonld_phones[0]
+                    self.logger.info(f"✅ Found phone via JSON-LD: {phone_from_linkedin}")
+            except Exception as e:
+                self.logger.debug(f"Error extracting phone from JSON-LD: {e}")
         
         # If not found in selectors, try searching in visible text
         if not phone_from_linkedin:
@@ -793,52 +1012,10 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     # Filter out false positives (too short, looks like dates, etc.)
                     for phone_candidate in phone_matches:
                         phone_clean = phone_candidate.strip()
-                        # Count digits only (not characters)
-                        digits_only = re.sub(r'[^\d]', '', phone_clean)
-                        
-                        # Skip if too short or too long
-                        if len(digits_only) >= 10 and len(digits_only) <= 15:
-                            # Filter out false positives:
-                            # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
-                            #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
-                            if re.match(r'^\d{1,2}\.\d{1,5}$', phone_clean):
-                                self.logger.debug(f"Skipping version number: {phone_clean}")
-                                continue
-                            # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
-                            #   Check if it starts with a version number pattern
-                            phone_parts = phone_clean.split()
-                            if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
-                                self.logger.debug(f"Skipping version number with text: {phone_clean}")
-                                continue
-                            # - IP addresses
-                            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
-                                self.logger.debug(f"Skipping IP address: {phone_clean}")
-                                continue
-                            # - Just 4 digits (years)
-                            if re.match(r'^\d{4}$', phone_clean):
-                                self.logger.debug(f"Skipping year: {phone_clean}")
-                                continue
-                            # - Employee count ranges like "201-500", "1-10", "11-50"
-                            if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
-                                self.logger.debug(f"Skipping employee count range: {phone_clean}")
-                                continue
-                            # - Email-like patterns (contains @ or looks like email)
-                            if '@' in phone_clean or re.search(r'[a-zA-Z]', phone_clean):
-                                self.logger.debug(f"Skipping email-like pattern: {phone_clean}")
-                                continue
-                            # - Check if phone has multiple parts separated by spaces (might be version + text)
-                            #   If it has more than 3 parts, it's likely not a phone number
-                            if len(phone_parts) > 3:
-                                self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_clean}")
-                                continue
-                            # - Should look like a phone number (has +, 0, or proper format)
-                            if (phone_clean.startswith('+') or 
-                                phone_clean.startswith('0') or 
-                                re.match(r'^\+?\d{1,3}', phone_clean) or
-                                '(' in phone_clean or '-' in phone_clean):
-                                phone_from_linkedin = phone_clean
-                                self.logger.info(f"✅ Found phone in page text: {phone_from_linkedin}")
-                                break
+                        if self._is_plausible_phone(phone_clean, source="linkedin_text", context_text=visible_text):
+                            phone_from_linkedin = phone_clean
+                            self.logger.info(f"✅ Found phone in LinkedIn visible text: {phone_from_linkedin}")
+                            break
             except Exception as e:
                 self.logger.debug(f"Error searching for phone in visible text: {e}")
         
@@ -848,6 +1025,9 @@ class SectorBasedScraperSpider(scrapy.Spider):
             'dd a[href^="mailto:"]::attr(href)',  # About page structure
             'dd a[href^="mailto:"] span::text',
             '.org-top-card-summary-info-list__item:contains("@")::text',
+            # Common LinkedIn labels (TR/EN)
+            'dt:contains("Email") + dd a::attr(href)',
+            'dt:contains("E-posta") + dd a::attr(href)',
         ]
         for selector in email_selectors:
             try:
@@ -894,7 +1074,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 self.logger.debug(f"Error searching for email in visible text: {e}")
 
         # Company Details Block - Modern LinkedIn structure
-            website = None
+        website = None
         visible_text = ""  # Initialize for use in sector filtering
         try:
             # Website - More specific selectors including About page structure
@@ -987,6 +1167,8 @@ class SectorBasedScraperSpider(scrapy.Spider):
             hq_selectors = [
                 ".org-top-card-summary-info-list__item:contains('Headquarters')::text",
                 ".core-section-container__content:contains('Headquarters')::text",
+                "dt:contains('Genel merkez') + dd::text",  # TR
+                "dt:contains('Headquarters') + dd::text",
             ]
             for selector in hq_selectors:
                 try:
@@ -1031,9 +1213,16 @@ class SectorBasedScraperSpider(scrapy.Spider):
                     specialties = specialties_match.group(1).strip()
                     if '$recipeTypes' in specialties or 'entityUrn' in specialties:
                         specialties = "not-found"
-            
+
         except Exception as e:
             self.logger.warning(f"Error parsing company details for {response.url}: {e}")
+
+        # --- LinkedIn-first location policy ---
+        linkedin_location = ""
+        if headquarters and headquarters != "not-found":
+            linkedin_location = headquarters.strip()
+        # If LinkedIn didn't provide, keep requested_location (CLI arg) as fallback
+        final_location = linkedin_location or (requested_location or "")
         
         # Filter by sector/industry match - TEMPORARILY DISABLED FOR TESTING
         # TODO: Re-enable sector filtering after testing
@@ -1124,7 +1313,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             emails_list = [email_from_linkedin] if email_from_linkedin else []
             item = LeadItem(
                 sector=sector,
-                location=location,
+                location=final_location,
                 company_name=company_name,
                 phone=phone_from_linkedin or "",
                 emails=emails_list,
@@ -1159,7 +1348,8 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 'pages_processed': 0,
                 'total_pages': len(self.CONTACT_PATHS),
                 'sector': sector,
-                'location': location,
+                'location': final_location,
+                'location_from_linkedin': final_location,
             }
             
             # Request multiple pages from the website
@@ -1179,7 +1369,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             # No website, yield item with empty contact info
             item = LeadItem(
                 sector=sector,
-                location=location,
+                location=final_location,
                 company_name=company_name,
                 phone=phone_from_linkedin or "",
                 emails=[email_from_linkedin] if email_from_linkedin else [],
@@ -1192,7 +1382,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
             yield item
 
     def parse_website_for_contacts(self, response):
-        """Extract emails and phone numbers from website pages"""
+        """Extract emails and phone numbers from website pages - Enhanced with comprehensive extraction"""
         company_key = response.meta.get('company_key')
         
         if company_key not in self.companies_in_progress:
@@ -1202,112 +1392,243 @@ class SectorBasedScraperSpider(scrapy.Spider):
         company_data = self.companies_in_progress[company_key]
         company_data['pages_processed'] += 1
         
-        # Extract emails from page text
         page_text = response.text
-        emails_found = set(self.EMAIL_PATTERN.findall(page_text))
         
-        # Normalize emails (lowercase)
+        # === 1. STRUCTURED DATA (JSON-LD) - Highest priority ===
+        json_ld_phones = self._extract_phones_from_json_ld(response)
+        if json_ld_phones:
+            current_phone = company_data.get('phone', '')
+            should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+            if should_update_phone:
+                for phone in json_ld_phones:
+                    phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                    phone_clean = re.sub(r'\s+', ' ', phone_clean)
+                    if self._is_plausible_phone(phone_clean, source="website_tel", context_text="json_ld"):
+                        company_data['phone'] = phone_clean
+                        self.logger.info(f"✅ Found phone from JSON-LD on {response.url}: {phone_clean}")
+                        break
+        
+        # === 2. HTML ATTRIBUTES (data-phone, data-tel, itemprop, etc.) ===
+        # Check data attributes
+        data_attrs = ['data-phone', 'data-tel', 'data-telephone', 'data-phone-number', 
+                     'data-contact-phone', 'data-mobile', 'data-phone-number']
+        for attr_name in data_attrs:
+            try:
+                elements = response.css(f'[{attr_name}]')
+                for elem in elements:
+                    phone_attr = elem.css(f"::attr({attr_name})").get()
+                    if phone_attr:
+                        phone_clean = re.sub(r'[^\d+\-().\s]', '', phone_attr).strip()
+                        phone_clean = re.sub(r'\s+', ' ', phone_clean)
+                        if self._is_plausible_phone(phone_clean, source="website_tel", context_text=""):
+                            current_phone = company_data.get('phone', '')
+                            should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+                            if should_update_phone:
+                                company_data['phone'] = phone_clean
+                                self.logger.info(f"✅ Found phone from {attr_name} attribute on {response.url}: {phone_clean}")
+                                break
+                if company_data.get('phone'):
+                    break
+            except Exception:
+                continue
+        
+        # Check itemprop attributes
+        itemprop_phones = response.css("[itemprop='telephone'], [itemprop='phone']").css("::text, ::attr(content)").getall()
+        for phone_text in itemprop_phones:
+            phone_matches = self.PHONE_PATTERN.findall(phone_text)
+            for phone in phone_matches:
+                phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                phone_clean = re.sub(r'\s+', ' ', phone_clean)
+                if self._is_plausible_phone(phone_clean, source="website_tel", context_text=""):
+                    current_phone = company_data.get('phone', '')
+                    should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+                    if should_update_phone:
+                        company_data['phone'] = phone_clean
+                        self.logger.info(f"✅ Found phone from itemprop on {response.url}: {phone_clean}")
+                        break
+            if company_data.get('phone'):
+                break
+        
+        # === 3. EXPLICIT LINKS (tel:, mailto:) ===
+        # Check all tel: links (not just footer)
+        tel_links = response.css("a[href^='tel:']::attr(href)").getall()
+        current_phone = company_data.get('phone', '')
+        should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+        if should_update_phone and tel_links:
+            for href in tel_links:
+                phone = href.replace("tel:", "").split("?")[0].strip()  # Remove query params
+                phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                if self._is_plausible_phone(phone_clean, source="website_tel", context_text=""):
+                    company_data['phone'] = phone_clean
+                    self.logger.info(f"✅ Found phone from tel: link on {response.url}: {phone_clean}")
+                    break
+        
+        # Check all mailto: links
+        mailto_links = response.css("a[href^='mailto:']::attr(href)").getall()
+        for href in mailto_links:
+            email = href.replace("mailto:", "").split("?")[0].strip()  # Remove query params
+            if email and '@' in email:
+                email_lower = email.lower()
+                if not any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@']):
+                    company_data['emails'].add(email_lower)
+                    self.logger.info(f"📧 Found email from mailto: link on {response.url}: {email_lower}")
+        
+        # === 4. CONTACT-SPECIFIC CSS SELECTORS ===
+        contact_selectors = [
+            '.contact-info', '.contact-details', '.contact-information', '.contact-data',
+            '.contact-block', '.contact-section', '.contact-wrapper', '.contact-content',
+            '#contact-info', '#contact-details', '#contact-information',
+            '.address', '.address-block', '.address-info', '#address', '#address-block',
+            '.iletisim', '.iletisim-bilgileri', '.iletisim-detaylari',
+            '#iletisim', '#iletisim-bilgileri',
+            '[class*="contact"]', '[id*="contact"]', '[class*="iletisim"]', '[id*="iletisim"]',
+        ]
+        
+        contact_text = ""
+        for selector in contact_selectors:
+            try:
+                elements = response.css(selector)
+                if elements:
+                    texts = elements.css("::text").getall()
+                    contact_text += " " + " ".join(t.strip() for t in texts if t.strip())
+            except Exception:
+                continue
+        
+        # Extract from contact-specific areas
+        if contact_text:
+            # Phones from contact areas
+            contact_phones = self.PHONE_PATTERN.findall(contact_text)
+            current_phone = company_data.get('phone', '')
+            should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+            if should_update_phone and contact_phones:
+                for phone in contact_phones:
+                    phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
+                    phone_clean = re.sub(r'\s+', ' ', phone_clean)
+                    if self._is_plausible_phone(phone_clean, source="website_text", context_text=contact_text[:4000]):
+                        company_data['phone'] = phone_clean
+                        self.logger.info(f"✅ Found phone in contact sections on {response.url}: {phone_clean}")
+                        break
+            
+            # Emails from contact areas
+            contact_emails = set(self.EMAIL_PATTERN.findall(contact_text))
+            contact_emails = {e.lower() for e in contact_emails}
+            filtered_contact_emails = set()
+            for email in contact_emails:
+                email_lower = email.lower()
+                if not any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@', 'no-reply@', 'placeholder@', '@example', 'email@', 'mail@']):
+                    if '@' in email:
+                        parts = email.split('@')
+                        if len(parts) == 2 and '.' in parts[1] and len(parts[0]) > 0:
+                            filtered_contact_emails.add(email)
+            if filtered_contact_emails:
+                company_data['emails'].update(filtered_contact_emails)
+                self.logger.info(f"📧 Found {len(filtered_contact_emails)} emails in contact sections on {response.url}")
+        
+        # === 5. FORM FIELDS ===
+        form_inputs = response.css("input[type='email'], input[type='tel'], input[name*='email'], input[name*='phone'], input[placeholder*='email'], input[placeholder*='phone'], input[placeholder*='telefon']")
+        for inp in form_inputs:
+            placeholder = inp.css("::attr(placeholder)").get() or ""
+            value = inp.css("::attr(value)").get() or ""
+            name = inp.css("::attr(name)").get() or ""
+            
+            # Email from form fields
+            if 'email' in placeholder.lower() or 'email' in name.lower():
+                email_matches = self.EMAIL_PATTERN.findall(placeholder + " " + value)
+                for email in email_matches:
+                    email_lower = email.lower()
+                    if not any(skip in email_lower for skip in ['example.com', 'test@', 'placeholder@']):
+                        company_data['emails'].add(email_lower)
+            
+            # Phone from form fields
+            if ('phone' in placeholder.lower() or 'tel' in placeholder.lower() or 'telefon' in placeholder.lower() or 'phone' in name.lower()) and value:
+                phone_matches = self.PHONE_PATTERN.findall(value)
+                if phone_matches:
+                    phone_clean = re.sub(r'[^\d+\-().\s]', '', phone_matches[0]).strip()
+                    if self._is_plausible_phone(phone_clean, source="website_text", context_text=placeholder):
+                        current_phone = company_data.get('phone', '')
+                        should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
+                        if should_update_phone:
+                            company_data['phone'] = phone_clean
+                            self.logger.info(f"✅ Found phone from form field on {response.url}: {phone_clean}")
+        
+        # === 6. GENERAL PAGE TEXT EXTRACTION ===
+        # Extract emails from page text
+        emails_found = set(self.EMAIL_PATTERN.findall(page_text))
         emails_found = {email.lower() for email in emails_found}
         
-        # Filter out common non-email patterns (like image URLs, CSS, JS)
         filtered_emails = set()
         for email in emails_found:
-            # Basic checks
             if email.startswith('//') or '@' not in email:
                 continue
             if email.endswith(('.png', '.jpg', '.gif', '.css', '.js')):
                 continue
-            # False positive checks
             email_lower = email.lower()
             if any(skip in email_lower for skip in ['example.com', 'test@', 'noreply@', 'no-reply@', 'placeholder@', '@example', 'email@', 'mail@']):
                 continue
-            # Email format validation
             if '@' in email:
                 parts = email.split('@')
                 if len(parts) == 2:
                     local_part, domain = parts
-                    # Local part boş olmamalı
                     if len(local_part) == 0:
                         continue
-                    # Domain'de nokta olmalı
                     if '.' not in domain:
                         continue
-                    # Domain name boş olmamalı
                     domain_parts = domain.split('.')
                     if len(domain_parts[0]) == 0:
                         continue
                     filtered_emails.add(email)
-        emails_found = filtered_emails
         
-        if emails_found:
-            self.logger.info(f"Found {len(emails_found)} emails on {response.url}")
-            company_data['emails'].update(emails_found)
+        if filtered_emails:
+            self.logger.info(f"📧 Found {len(filtered_emails)} emails in page text on {response.url}")
+            company_data['emails'].update(filtered_emails)
         
-        # Extract phone numbers from page text
+        # Extract phone numbers from page text (with broader context)
         phones_found = self.PHONE_PATTERN.findall(page_text)
         if phones_found:
-            # Only update if we don't have a valid phone yet
             current_phone = company_data.get('phone', '')
-            # Check if current phone is invalid (employee count range or empty)
             should_update_phone = not current_phone or re.match(r'^\d{1,4}-\d{1,4}$', current_phone)
             
             if should_update_phone:
-                # Use the first valid phone number found
                 for phone in phones_found:
-                    # Clean up phone number
                     phone_clean = re.sub(r'[^\d+\-().\s]', '', phone).strip()
-                    # Remove extra spaces
                     phone_clean = re.sub(r'\s+', ' ', phone_clean)
                     
-                    # Filter out false positives:
-                    # - Too short (less than 10 digits)
-                    # - Looks like a date/year (4 digits)
-                    # - Too many digits (likely not a phone)
-                    digits_only = re.sub(r'[^\d]', '', phone_clean)
-                    if len(digits_only) >= 10 and len(digits_only) <= 15:
-                        # Filter out false positives:
-                        # - Version numbers like "10.001", "20.55", "1.19963", "6.0039"
-                        #   Pattern: X.Y, X.YY, X.YYY, X.YYYY, X.YYYYY (where X is 1-2 digits, Y is 1-5 digits)
-                        if re.match(r'^\d{1,2}\.\d{1,5}$', phone_clean):
-                            self.logger.debug(f"Skipping version number: {phone_clean}")
-                            continue
-                        # - Version numbers with spaces like "20.55 13 21 12" (version + other text)
-                        #   Check if it starts with a version number pattern
-                        phone_parts = phone_clean.split()
-                        if len(phone_parts) > 1 and re.match(r'^\d{1,2}\.\d{1,5}$', phone_parts[0]):
-                            self.logger.debug(f"Skipping version number with text: {phone_clean}")
-                            continue
-                        # - IP addresses
-                        if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', phone_clean):
-                            self.logger.debug(f"Skipping IP address: {phone_clean}")
-                            continue
-                        # - Just 4 digits (years)
-                        if re.match(r'^\d{4}$', phone_clean):
-                            self.logger.debug(f"Skipping year: {phone_clean}")
-                            continue
-                        # - Employee count ranges like "201-500", "1-10"
-                        if re.match(r'^\d{1,4}-\d{1,4}$', phone_clean):
-                            self.logger.debug(f"Skipping employee count range: {phone_clean}")
-                            continue
-                        # - Email-like patterns (contains @ or looks like email)
-                        if '@' in phone_clean or re.search(r'[a-zA-Z]', phone_clean):
-                            self.logger.debug(f"Skipping email-like pattern: {phone_clean}")
-                            continue
-                        # - Check if phone has multiple parts separated by spaces (might be version + text)
-                        #   If it has more than 3 parts, it's likely not a phone number
-                        if len(phone_parts) > 3:
-                            self.logger.debug(f"Skipping multi-part text (likely not phone): {phone_clean}")
-                            continue
-                        # Additional validation: should contain country code or area code pattern
-                        # Turkish: starts with 0 or +90, or has area code pattern
-                        # International: starts with + or has country code
-                        if (phone_clean.startswith('+') or 
-                            phone_clean.startswith('0') or 
-                            re.match(r'^\+?\d{1,3}', phone_clean) or
-                            '(' in phone_clean or '-' in phone_clean):
-                            company_data['phone'] = phone_clean
-                            self.logger.info(f"✅ Found phone number on {response.url}: {phone_clean}")
-                            break
+                    # Use larger context window for better validation
+                    context_start = max(0, page_text.find(phone) - 200)
+                    context_end = min(len(page_text), page_text.find(phone) + len(phone) + 200)
+                    context = page_text[context_start:context_end]
+                    
+                    if self._is_plausible_phone(phone_clean, source="website_text", context_text=context):
+                        company_data['phone'] = phone_clean
+                        self.logger.info(f"✅ Found phone number on {response.url}: {phone_clean}")
+                        break
+
+        # === 7. LOCATION EXTRACTION ===
+        if not company_data.get("location_from_linkedin"):
+            if not company_data.get("location"):
+                loc = self._extract_location_from_website(response)
+                if loc:
+                    company_data["location"] = loc
+                    self.logger.info(f"📍 Found location on {response.url}: {loc}")
+
+        # === 8. FOOTER EXTRACTION (only for contact-like pages) ===
+        url_lower = (response.url or "").lower()
+        if any(marker in url_lower for marker in self.CONTACT_LIKE_PATH_MARKERS):
+            footer_info = self._extract_from_footer(response)
+            if footer_info.get("emails"):
+                company_data["emails"].update(footer_info["emails"])
+            current_phone = company_data.get("phone", "")
+            should_update_phone = not current_phone or re.match(r"^\d{1,4}-\d{1,4}$", current_phone or "")
+            if should_update_phone and footer_info.get("phones"):
+                for p in footer_info["phones"]:
+                    if self._is_plausible_phone(p, source="website_text", context_text="footer"):
+                        company_data["phone"] = p
+                        self.logger.info(f"✅ Found phone number in footer on {response.url}: {p}")
+                        break
+            if not company_data.get("location_from_linkedin") and not company_data.get("location"):
+                if footer_info.get("location"):
+                    company_data["location"] = footer_info["location"]
+                    self.logger.info(f"📍 Found location in footer on {response.url}: {footer_info['location']}")
         
         # Check if all pages have been processed
         if company_data['pages_processed'] >= company_data['total_pages']:
