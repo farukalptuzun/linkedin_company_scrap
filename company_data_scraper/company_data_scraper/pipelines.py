@@ -110,6 +110,7 @@ class MongoPipeline:
             'company_name': adapter.get('company_name'),
             'phone': adapter.get('phone'),
             'website': website,
+            'about': adapter.get('about', ''),
             'source': adapter.get('source', 'google_places'),
             'created_at': adapter.get('created_at', datetime.utcnow()),
         }
@@ -142,6 +143,7 @@ class MongoPipeline:
                 'company_name': doc['company_name'],
                 'phone': doc['phone'],
                 'website': doc['website'],
+                'about': doc['about'],
                 'source': doc['source'],
                 'updated_at': datetime.utcnow(),
             },

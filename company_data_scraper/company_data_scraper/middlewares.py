@@ -227,7 +227,41 @@ class SeleniumMiddleware:
                     )
                 except:
                     pass
-                time.sleep(5)  # Extra wait for JavaScript to render content
+                
+                # Special handling for about pages - wait for about content to load
+                is_about_page = '/about/' in request.url or '/about' in request.url
+                if is_about_page:
+                    spider.logger.debug("📄 About page detected, waiting for content to load...")
+                    try:
+                        # Wait for about content selectors to appear
+                        about_selectors = [
+                            (By.CSS_SELECTOR, ".core-section-container__content"),
+                            (By.CSS_SELECTOR, ".org-about-us-organization-description__text"),
+                            (By.CSS_SELECTOR, "[data-test-id='about-us-description']"),
+                            (By.CSS_SELECTOR, ".break-words"),
+                        ]
+                        content_found = False
+                        for selector_type, selector in about_selectors:
+                            try:
+                                WebDriverWait(self.driver, 10).until(
+                                    EC.presence_of_element_located((selector_type, selector))
+                                )
+                                content_found = True
+                                spider.logger.debug(f"✅ About content found with selector: {selector}")
+                                break
+                            except:
+                                continue
+                        
+                        if content_found:
+                            time.sleep(3)  # Extra wait for content to fully render
+                        else:
+                            spider.logger.warning("⚠️  About content selectors not found, using default wait")
+                            time.sleep(5)
+                    except Exception as e:
+                        spider.logger.debug(f"Error waiting for about content: {e}")
+                        time.sleep(5)  # Fallback wait
+                else:
+                    time.sleep(5)  # Extra wait for JavaScript to render content
                 
                 # Check if LinkedIn redirected/normalized the URL (especially for pagination)
                 final_url = self.driver.current_url

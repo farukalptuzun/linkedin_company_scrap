@@ -22,4 +22,5 @@ class LeadItem(scrapy.Item):
     emails = scrapy.Field()  # List of email addresses
     website = scrapy.Field()
     source = scrapy.Field()  # e.g., "google_places"
+    about = scrapy.Field()  # Company description from LinkedIn or website
     created_at = scrapy.Field()

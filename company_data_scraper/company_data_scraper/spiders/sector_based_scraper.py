@@ -381,14 +381,18 @@ class SectorBasedScraperSpider(scrapy.Spider):
     
     # LinkedIn Sector ID mapping (f_I parameter values)
     # These are LinkedIn's internal industry/vertical IDs
+    # Note: f_I parameter uses industryCompanyVertical IDs
+    # IMPORTANT: Only include verified sector IDs. If a sector is not listed here,
+    # the spider will fall back to keyword search which is more reliable.
     LINKEDIN_SECTOR_IDS = {
         'technology': ['96', '1594', '6'],  # BT Hizmetleri ve BT Danışmanlığı, Teknoloji Bilgi ve Medya, Teknoloji Bilgi ve İnternet
         'bt': ['96'],  # BT Hizmetleri ve BT Danışmanlığı
-        'finance': ['43'],  # Finansal Hizmetler (approximate)
-        'healthcare': ['6'],  # Sağlık (approximate)
+        'finance': ['43'],  # Finansal Hizmetler
+        # 'healthcare': REMOVED - ID 6 was incorrect (it's Technology, not Healthcare)
+        # Healthcare will use keyword search fallback which is more accurate
         'manufacturing': ['25'],  # Üretim
-        'retail': ['47'],  # Perakende (approximate)
-        'education': ['5'],  # Eğitim (approximate)
+        'retail': ['47'],  # Perakende
+        'education': ['5'],  # Eğitim
     }
     
     # LinkedIn GeoId mapping (companyHqGeo parameter values)
@@ -1021,6 +1025,122 @@ class SectorBasedScraperSpider(scrapy.Spider):
             self.logger.debug(f"Response body preview (first 1000 chars): {response.text[:1000] if response.text else 'No text'}")
             return
 
+        # Extract "Genel Bakış" (About) description from LinkedIn
+        about_from_linkedin = None
+        about_selectors = [
+            # New LinkedIn structure (2024+)
+            ".org-about-us-organization-description__text::text",  # Organization description (most reliable)
+            ".org-about-us-organization-description p::text",  # Paragraphs in description
+            ".org-about-us-organization-description__text p::text",  # Nested paragraphs
+            "div[data-test-id='about-us-description'] p::text",  # Test ID selector
+            "div[data-test-id='about-us-description']::text",  # Test ID text directly
+            
+            # Legacy selectors
+            ".core-section-container__content p::text",  # Main about section paragraphs
+            ".about-us__text::text",  # About us text
+            ".break-words p::text",  # Common LinkedIn text wrapper
+            ".break-words::text",  # Direct text
+            
+            # Fallback selectors
+            ".core-section-container__content::text",  # All text in content area
+            "section[data-section='about'] p::text",  # Section-based selector
+            "section[data-section='about']::text",  # Section text directly
+            ".org-about-us-module__description p::text",  # Module description
+            ".org-about-us-module__description::text",  # Module text directly
+        ]
+        
+        self.logger.debug(f"🔍 Extracting about from LinkedIn page: {response.url}")
+        
+        for selector in about_selectors:
+            try:
+                about_texts = response.css(selector).getall()
+                if about_texts:
+                    # Join multiple paragraphs, clean up
+                    about_text = " ".join([t.strip() for t in about_texts if t.strip()])
+                    # Remove excessive whitespace
+                    about_text = re.sub(r'\s+', ' ', about_text).strip()
+                    # Filter out very short or JSON-like content
+                    if len(about_text) > 50 and '$recipeTypes' not in about_text and 'entityUrn' not in about_text:
+                        # Additional filtering: remove common noise
+                        if not re.match(r'^[\d\s\-\.]+$', about_text):  # Not just numbers
+                            about_from_linkedin = about_text[:2000]  # Limit to 2000 chars
+                            self.logger.info(f"✅ Found LinkedIn about description ({len(about_from_linkedin)} chars) using selector: {selector}")
+                            break
+            except Exception as e:
+                self.logger.debug(f"Error with about selector {selector}: {e}")
+                continue
+        
+        # If not found with specific selectors, try extracting from visible text in about section
+        if not about_from_linkedin:
+            try:
+                # Look for about section containers with more comprehensive selectors
+                about_containers = response.css(
+                    ".org-about-us-organization-description, "
+                    ".core-section-container__content, "
+                    "[data-test-id='about-us-description'], "
+                    "section[data-section='about'], "
+                    ".org-about-us-module__description, "
+                    ".break-words"
+                )
+                if about_containers:
+                    # Try multiple extraction methods
+                    about_texts = []
+                    # Method 1: Direct text from paragraphs
+                    about_texts.extend(about_containers.css("p::text").getall())
+                    # Method 2: Direct text from divs (if no paragraphs)
+                    if not about_texts:
+                        about_texts.extend(about_containers.css("div::text").getall())
+                    # Method 3: All text content
+                    if not about_texts:
+                        about_texts.extend(about_containers.css("::text").getall())
+                    
+                    if about_texts:
+                        # Filter and clean
+                        filtered_texts = [t.strip() for t in about_texts if t.strip() and len(t.strip()) > 20]
+                        about_text = " ".join(filtered_texts)
+                        about_text = re.sub(r'\s+', ' ', about_text).strip()
+                        # Remove common noise patterns
+                        about_text = re.sub(r'(cookie|privacy|kvkk|terms|copyright|follow|takip|social|media|linkedin).*', '', about_text, flags=re.IGNORECASE).strip()
+                        
+                        if len(about_text) > 50 and '$recipeTypes' not in about_text and 'entityUrn' not in about_text:
+                            if not re.match(r'^[\d\s\-\.]+$', about_text):
+                                about_from_linkedin = about_text[:2000]
+                                self.logger.info(f"✅ Found LinkedIn about from containers ({len(about_from_linkedin)} chars)")
+            except Exception as e:
+                self.logger.debug(f"Error extracting about from containers: {e}")
+        
+        # Final fallback: Try to extract from page source using regex if still not found
+        if not about_from_linkedin:
+            try:
+                # Look for common about text patterns in HTML
+                page_text = response.text
+                # Try to find text between common about markers
+                about_patterns = [
+                    r'<div[^>]*class="[^"]*about[^"]*"[^>]*>(.*?)</div>',
+                    r'<p[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</p>',
+                    r'<section[^>]*data-section="about"[^>]*>(.*?)</section>',
+                ]
+                for pattern in about_patterns:
+                    matches = re.findall(pattern, page_text, re.DOTALL | re.IGNORECASE)
+                    if matches:
+                        # Extract text from HTML
+                        from bs4 import BeautifulSoup
+                        for match in matches:
+                            soup = BeautifulSoup(match, 'html.parser')
+                            text = soup.get_text(strip=True)
+                            if len(text) > 50 and '$recipeTypes' not in text:
+                                about_from_linkedin = text[:2000]
+                                self.logger.info(f"✅ Found LinkedIn about using regex fallback ({len(about_from_linkedin)} chars)")
+                                break
+                        if about_from_linkedin:
+                            break
+            except Exception as e:
+                self.logger.debug(f"Error in regex fallback: {e}")
+        
+        if not about_from_linkedin:
+            self.logger.warning(f"⚠️  Could not extract about description from LinkedIn page: {response.url}")
+            self.logger.debug(f"Page preview (first 500 chars): {response.text[:500] if response.text else 'No text'}")
+
         # Extract phone and email from LinkedIn profile (if available)
         phone_from_linkedin = None
         email_from_linkedin = None
@@ -1391,6 +1511,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 phone=phone_from_linkedin or "",
                 emails=emails_list,
                 website=website or None,
+                about=about_from_linkedin or "",
                 source='linkedin',
                 created_at=datetime.utcnow(),
             )
@@ -1418,6 +1539,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 'phone': phone_from_linkedin if phone_is_valid else "",
                 'website': website,
                 'emails': set([email_from_linkedin] if email_from_linkedin else []),
+                'about': about_from_linkedin or "",  # LinkedIn about, will be updated from website if empty
                 'pages_processed': 0,
                 'total_pages': len(self.CONTACT_PATHS),
                 'sector': sector,
@@ -1447,6 +1569,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 phone=phone_from_linkedin or "",
                 emails=[email_from_linkedin] if email_from_linkedin else [],
                 website=None,
+                about=about_from_linkedin or "",
                 source='linkedin',
                 created_at=datetime.utcnow(),
             )
@@ -1466,6 +1589,46 @@ class SectorBasedScraperSpider(scrapy.Spider):
         company_data['pages_processed'] += 1
         
         page_text = response.text
+        
+        # === 0. EXTRACT ABOUT DESCRIPTION FROM WEBSITE (if LinkedIn about is empty) ===
+        # Only extract if this is an "about" page and LinkedIn didn't provide about text
+        if not company_data.get('about'):
+            url_path = response.url.lower()
+            is_about_page = any(path in url_path for path in ['/hakkimizda', '/about', '/about-us', '/hakkımızda'])
+            
+            if is_about_page:
+                about_selectors = [
+                    'main p::text',  # Main content paragraphs
+                    '.about-content p::text',  # About content class
+                    '#about p::text',  # About ID
+                    '.content p::text',  # Content class
+                    'article p::text',  # Article tag
+                    '.about-section p::text',  # About section
+                    '[class*="about"] p::text',  # Any class containing "about"
+                    '[id*="about"] p::text',  # Any ID containing "about"
+                ]
+                
+                about_texts = []
+                for selector in about_selectors:
+                    try:
+                        texts = response.css(selector).getall()
+                        if texts:
+                            about_texts.extend([t.strip() for t in texts if t.strip() and len(t.strip()) > 20])
+                            if len(about_texts) >= 2:  # Found enough content
+                                break
+                    except Exception:
+                        continue
+                
+                if about_texts:
+                    # Join paragraphs, clean up, limit length
+                    about_text = " ".join(about_texts)
+                    about_text = re.sub(r'\s+', ' ', about_text).strip()
+                    # Remove common noise (navigation, footer text, etc.)
+                    about_text = re.sub(r'(cookie|privacy|kvkk|terms|copyright|follow|takip|social|media).*', '', about_text, flags=re.IGNORECASE).strip()
+                    # Limit to meaningful length (500-1000 chars)
+                    if len(about_text) > 50:
+                        company_data['about'] = about_text[:1000]
+                        self.logger.info(f"✅ Found about description from website ({len(company_data['about'])} chars): {response.url}")
         
         # === 1. STRUCTURED DATA (JSON-LD) - Highest priority ===
         json_ld_phones = self._extract_phones_from_json_ld(response)
@@ -1720,6 +1883,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 phone=company_data['phone'],
                 emails=list(company_data['emails']),
                 website=company_data['website'],
+                about=company_data.get('about', ''),
                 source='linkedin',
                 created_at=datetime.utcnow(),
             )
@@ -1773,6 +1937,7 @@ class SectorBasedScraperSpider(scrapy.Spider):
                 phone=company_data['phone'],
                 emails=list(company_data['emails']),
                 website=company_data['website'],
+                about=company_data.get('about', ''),
                 source='linkedin',
                 created_at=datetime.utcnow(),
             )
