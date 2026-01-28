@@ -35,6 +35,10 @@ class LLMSectorFilter:
         self.mongo_uri = mongo_uri or os.getenv('MONGO_URI', 'mongodb://localhost:27017')
         self.mongo_db = mongo_db or os.getenv('MONGO_DB', 'leads_db')
         self.claude_api_key = claude_api_key or os.getenv('CLAUDE_API_KEY')
+        # Allow overriding model via env var to avoid hardcoding deprecated IDs.
+        # Pick a conservative default that is commonly available for most keys.
+        # You can also set CLAUDE_MODEL in your .env / environment.
+        self.claude_model = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-20250514')
         
         if not self.claude_api_key:
             raise ValueError("CLAUDE_API_KEY environment variable is required")
@@ -147,7 +151,7 @@ Format:
         for attempt in range(max_retries):
             try:
                 message = self.claude_client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
+                    model=self.claude_model,
                     max_tokens=4096,
                     messages=[
                         {
