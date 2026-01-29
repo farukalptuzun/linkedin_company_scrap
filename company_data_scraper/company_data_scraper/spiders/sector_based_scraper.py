@@ -3,6 +3,7 @@ import scrapy
 from urllib.parse import quote_plus, urljoin
 from datetime import datetime
 from company_data_scraper.items import LeadItem
+from company_data_scraper.sector_mappings import SECTOR_MAPPINGS, LINKEDIN_SECTOR_IDS
 import json
 
 
@@ -366,34 +367,10 @@ class SectorBasedScraperSpider(scrapy.Spider):
 
         return {"emails": filtered_emails, "phones": phones, "location": location}
     
-    # Sector/Industry mapping for Turkish-English matching
-    SECTOR_MAPPINGS = {
-        'technology': ['technology', 'bilgi teknolojisi', 'bt', 'information technology', 'it', 
-                      'bt hizmetleri', 'bilgi teknolojisi ve hizmetleri', 'information technology and services'],
-        'bt': ['bt', 'bilgi teknolojisi', 'technology', 'information technology', 'it',
-              'bt hizmetleri', 'bilgi teknolojisi ve hizmetleri'],
-        'finance': ['finance', 'finans', 'financial services', 'finansal hizmetler'],
-        'healthcare': ['healthcare', 'sağlık', 'health', 'sağlık hizmetleri'],
-        'manufacturing': ['manufacturing', 'imalat', 'üretim'],
-        'retail': ['retail', 'perakende', 'retail trade'],
-        'education': ['education', 'eğitim', 'educational services'],
-    }
-    
-    # LinkedIn Sector ID mapping (f_I parameter values)
-    # These are LinkedIn's internal industry/vertical IDs
-    # Note: f_I parameter uses industryCompanyVertical IDs
-    # IMPORTANT: Only include verified sector IDs. If a sector is not listed here,
-    # the spider will fall back to keyword search which is more reliable.
-    LINKEDIN_SECTOR_IDS = {
-        'technology': ['96', '1594', '6'],  # BT Hizmetleri ve BT Danışmanlığı, Teknoloji Bilgi ve Medya, Teknoloji Bilgi ve İnternet
-        'bt': ['96'],  # BT Hizmetleri ve BT Danışmanlığı
-        'finance': ['43'],  # Finansal Hizmetler
-        # 'healthcare': REMOVED - ID 6 was incorrect (it's Technology, not Healthcare)
-        # Healthcare will use keyword search fallback which is more accurate
-        'manufacturing': ['25'],  # Üretim
-        'retail': ['47'],  # Perakende
-        'education': ['5'],  # Eğitim
-    }
+    # Sector mappings are imported from sector_mappings module
+    # This keeps the spider file clean and allows easy updates to sector mappings
+    SECTOR_MAPPINGS = SECTOR_MAPPINGS
+    LINKEDIN_SECTOR_IDS = LINKEDIN_SECTOR_IDS
     
     # LinkedIn GeoId mapping (companyHqGeo parameter values)
     # Şehir adından LinkedIn GeoId'ye çevirmek için kullanılır
