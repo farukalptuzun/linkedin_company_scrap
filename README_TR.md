@@ -389,6 +389,48 @@ Her sektör için ayrı dosya üretilir:
 
 ---
 
+## 🌐 FastAPI ile Pipeline Yönetimi (Endpoint'ten)
+
+Bu modda scraping + LLM filtreleme akışı **job (job_id)** olarak başlatılır. İstek hemen döner; job durumunu ve sonucu ayrı endpoint’lerden takip edersiniz.
+
+### Sunucuyu Çalıştırma
+
+Root dizinde:
+
+```bash
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Pipeline Başlatma
+
+```bash
+curl -X POST "http://localhost:8000/pipeline/run" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sector": "Technology",
+    "location": "Istanbul",
+    "limit": 20,
+    "max_pages": 20,
+    "llm_batch_size": 15
+  }'
+```
+
+### Job Durumu
+
+```bash
+curl "http://localhost:8000/jobs/<job_id>"
+```
+
+### Sonuçlar (LLM filtre çıktısı özeti)
+
+```bash
+curl "http://localhost:8000/jobs/<job_id>/results"
+```
+
+> Not: Mongo bağlantısı için `MONGO_URI`, `MONGO_DB` env değişkenleri kullanılır. LLM filtre için `CLAUDE_API_KEY` gerekir.
+
+---
+
 ## 🔍 Teknik Detaylar
 
 ### Scrapy Ayarları (`settings.py`)
